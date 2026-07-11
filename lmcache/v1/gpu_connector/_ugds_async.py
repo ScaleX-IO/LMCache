@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: Apache-2.0
+"""ctypes wrapper around the uGDS async C API (libugds.so).
+
+Drop-in replacement for :mod:`_cufile_async` that uses uGDS's user-space
+NVMe path instead of cuFile. The API surface (AsyncHandle, Submission,
+register_*/deregister_*) is identical so that :mod:`gds_context` can use
+either backend transparently.
+
+uGDS operates on raw block devices (/dev/ugds_drv*), not filesystem files.
+Where _cufile_async opens a file fd, this module opens a uGDS device and
+registers an NVMe handle.
+"""
+
+# Standard
+import ctypes
+import ctypes.util
+import os
+from typing import Any, Optional
+
+
+# --- libugds.so lazy loading -----------------------------------------
+
+_lib: Optional[ctypes.CDLL] = None
+
+
+def _get_lib() -> ctypes.CDLL:
+    global _lib
+    if _lib is not None:
+        return _lib
+    search = ctypes.util.find_library("ugds")
+    path = search or "libugds.so"
+    _lib = ctypes.CDLL(path)
+    _declare_signatures(_lib)
+    return _lib
+
+
+# --- uGDS C types ----------------------------------------------------
+
+class _uGDSError_t(ctypes.Structure):
+    _fields_ = [
+        ("err", ctypes.c_int),
+        ("cu_err", ctypes.c_int),
+    ]
+
+
+class _uGDSDescr_t(ctypes.Structure):
+    class _HandleUnion(ctypes.Union):
+        _fields_ = [
+            ("fd", ctypes.c_int),
+            ("handle", ctypes.c_void_p),
+        ]
+
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("handle", _HandleUnion),
+    ]
+
+
+_UGDS_HANDLE_TYPE_OPAQUE_FD = 1
+
+
+def _declare_signatures(lib: ctypes.CDLL) -> None:
+    lib.uGDSDriverOpen.argtypes = []
+    lib.uGDSDriverOpen.restype = _uGDSError_t
+
+    lib.uGDSDriverClose.argtypes = []
+    lib.uGDSDriverClose.restype = _uGDSError_t
+
+    lib.uGDSHandleRegister.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),  # uGDSHandle_t *fh
+        ctypes.POINTER(_uGDSDescr_t),     # uGDSDescr_t *descr
+    ]
+    lib.uGDSHandleRegister.restype = _uGDSError_t
+
+    lib.uGDSHandleDeregister.argtypes = [ctypes.c_void_p]
+    lib.uGDSHandleDeregister.restype = None
+
+    lib.uGDSBufRegister.argtypes = [
+        ctypes.c_void_p,   # const void *bufPtr_base
+        ctypes.c_size_t,   # size_t length
+        ctypes.c_int,      # int flags
+    ]
+    lib.uGDSBufRegister.restype = _uGDSError_t
+
+    lib.uGDSBufDeregister.argtypes = [ctypes.c_void_p]
+    lib.uGDSBufDeregister.restype = _uGDSError_t
+
+    lib.uGDSReadAsync.argtypes = [
+        ctypes.c_void_p,                   # uGDSHandle_t fh
+        ctypes.c_void_p,                   # void *bufPtr_base
+        ctypes.POINTER(ctypes.c_size_t),   # size_t *size_p
+        ctypes.POINTER(ctypes.c_int64),    # off_t *file_offset_p
+        ctypes.POINTER(ctypes.c_int64),    # off_t *bufPtr_offset_p
+        ctypes.POINTER(ctypes.c_int64),    # ssize_t *bytes_read_p
+        ctypes.c_void_p,                   # cudaStream_t stream
+    ]
+    lib.uGDSReadAsync.restype = _uGDSError_t
+
+    lib.uGDSWriteAsync.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_void_p,
+    ]
+    lib.uGDSWriteAsync.restype = _uGDSError_t
+
+    lib.uGDSStreamRegister.argtypes = [ctypes.c_void_p]
+    lib.uGDSStreamRegister.restype = _uGDSError_t
+
+    lib.uGDSStreamDeregister.argtypes = [ctypes.c_void_p]
+    lib.uGDSStreamDeregister.restype = _uGDSError_t
+
+
+# --- Error checking --------------------------------------------------
+
+def _check(err: _uGDSError_t, op: str) -> None:
+    if err.err != 0:
+        raise RuntimeError(
+            f"{op} failed: uGDSError(err={err.err}, cu_err={err.cu_err})"
+        )
+
+
+# --- Driver lifecycle ------------------------------------------------
+
+_driver_opened = False
+
+
+def _ensure_driver_open() -> None:
+    global _driver_opened
+    if _driver_opened:
+        return
+    lib = _get_lib()
+    _check(lib.uGDSDriverOpen(), "uGDSDriverOpen")
+    _driver_opened = True
+
+
+def close_driver() -> None:
+    global _driver_opened
+    if not _driver_opened:
+        return
+    lib = _get_lib()
+    try:
+        _check(lib.uGDSDriverClose(), "uGDSDriverClose")
+    finally:
+        _driver_opened = False
+
+
+# --- Handle registration --------------------------------------------
+
+def register_handle(device_path: str) -> "AsyncHandle":
+    """Open a uGDS device and return an AsyncHandle.
+
+    Unlike _cufile_async.register_handle(fd), this takes a device path
+    (e.g. "/dev/ugds_drv0") because uGDS operates on raw block devices.
+    """
+    _ensure_driver_open()
+    fd = os.open(device_path, os.O_RDWR)
+    lib = _get_lib()
+    handle = ctypes.c_void_p()
+    descr = _uGDSDescr_t()
+    descr.type = _UGDS_HANDLE_TYPE_OPAQUE_FD
+    descr.handle.fd = fd
+    try:
+        _check(
+            lib.uGDSHandleRegister(ctypes.byref(handle), ctypes.byref(descr)),
+            "uGDSHandleRegister",
+        )
+    except Exception:
+        os.close(fd)
+        raise
+    return AsyncHandle._from_parts(fd, handle.value, device_path)
+
+
+def deregister_handle(handle: "AsyncHandle") -> None:
+    lib = _get_lib()
+    lib.uGDSHandleDeregister(ctypes.c_void_p(handle._handle))
+
+
+# --- Buffer / stream registration -----------------------------------
+
+def register_buffer(buf: "torch.Tensor") -> None:
+    import torch
+    if not buf.is_cuda:
+        raise ValueError("register_buffer: tensor must be on CUDA")
+    _ensure_driver_open()
+    lib = _get_lib()
+    nbytes = buf.numel() * buf.element_size()
+    _check(
+        lib.uGDSBufRegister(
+            ctypes.c_void_p(buf.data_ptr()),
+            ctypes.c_size_t(nbytes),
+            ctypes.c_int(0),
+        ),
+        "uGDSBufRegister",
+    )
+
+
+def deregister_buffer(buf: "torch.Tensor") -> None:
+    lib = _get_lib()
+    _check(
+        lib.uGDSBufDeregister(ctypes.c_void_p(buf.data_ptr())),
+        "uGDSBufDeregister",
+    )
+
+
+def register_stream(raw_stream: int) -> None:
+    _ensure_driver_open()
+    lib = _get_lib()
+    _check(
+        lib.uGDSStreamRegister(ctypes.c_void_p(raw_stream)),
+        "uGDSStreamRegister",
+    )
+
+
+def deregister_stream(raw_stream: int) -> None:
+    lib = _get_lib()
+    _check(
+        lib.uGDSStreamDeregister(ctypes.c_void_p(raw_stream)),
+        "uGDSStreamDeregister",
+    )
+
+
+# --- Submission + AsyncHandle ----------------------------------------
+
+class Submission:
+    """One in-flight uGDSReadAsync / uGDSWriteAsync.
+
+    Mirrors _cufile_async.Submission: holds ctypes storage that must
+    stay alive until the stream executes the op.
+    """
+
+    __slots__ = ("_size", "_file_offset", "_buf_offset", "_bytes_done")
+
+    def __init__(self, size: int, file_offset: int, buf_offset: int) -> None:
+        self._size = ctypes.c_size_t(size)
+        self._file_offset = ctypes.c_int64(file_offset)
+        self._buf_offset = ctypes.c_int64(buf_offset)
+        self._bytes_done = ctypes.c_int64(0)
+
+    @property
+    def bytes_done(self) -> int:
+        return self._bytes_done.value
+
+
+class AsyncHandle:
+    """uGDS device handle wrapper, API-compatible with _cufile_async.AsyncHandle."""
+
+    __slots__ = ("_fd", "_handle", "path", "writable")
+
+    def __init__(
+        self,
+        device_path: str,
+        writable: bool = True,
+    ) -> None:
+        handle_obj = register_handle(device_path)
+        self._fd = handle_obj._fd
+        self._handle = handle_obj._handle
+        self.path = handle_obj.path
+        self.writable = writable
+
+    @classmethod
+    def _from_parts(
+        cls,
+        fd: int,
+        handle: int,
+        path: str,
+        writable: bool = True,
+    ) -> "AsyncHandle":
+        obj = cls.__new__(cls)
+        obj._fd = fd
+        obj._handle = handle
+        obj.path = path
+        obj.writable = writable
+        return obj
+
+    @classmethod
+    def from_fd(
+        cls,
+        fd: int,
+        handle: Any,
+        path: str,
+        writable: bool = False,
+    ) -> "AsyncHandle":
+        """Compat shim matching _cufile_async.AsyncHandle.from_fd."""
+        return cls._from_parts(fd, handle, path, writable)
+
+    @property
+    def fd(self) -> int:
+        return self._fd
+
+    def read_async(
+        self,
+        buf_base: int,
+        size: int,
+        file_offset: int,
+        buf_offset: int,
+        raw_stream: int,
+    ) -> Submission:
+        lib = _get_lib()
+        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+        _check(
+            lib.uGDSReadAsync(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_void_p(buf_base),
+                ctypes.byref(sub._size),
+                ctypes.byref(sub._file_offset),
+                ctypes.byref(sub._buf_offset),
+                ctypes.byref(sub._bytes_done),
+                ctypes.c_void_p(raw_stream),
+            ),
+            "uGDSReadAsync",
+        )
+        return sub
+
+    def write_async(
+        self,
+        buf_base: int,
+        size: int,
+        file_offset: int,
+        buf_offset: int,
+        raw_stream: int,
+    ) -> Submission:
+        lib = _get_lib()
+        sub = Submission(size=size, file_offset=file_offset, buf_offset=buf_offset)
+        _check(
+            lib.uGDSWriteAsync(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_void_p(buf_base),
+                ctypes.byref(sub._size),
+                ctypes.byref(sub._file_offset),
+                ctypes.byref(sub._buf_offset),
+                ctypes.byref(sub._bytes_done),
+                ctypes.c_void_p(raw_stream),
+            ),
+            "uGDSWriteAsync",
+        )
+        return sub
+
+    def close(self) -> None:
+        if self._fd < 0:
+            return
+        lib = _get_lib()
+        try:
+            lib.uGDSHandleDeregister(ctypes.c_void_p(self._handle))
+        finally:
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = -1
+
+    def __enter__(self) -> "AsyncHandle":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
