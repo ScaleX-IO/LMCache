@@ -98,10 +98,10 @@ cold/hot and concurrent cache-hit tests, and saves results to JSON.
 ```bash
 # uGDS backend
 export LD_LIBRARY_PATH=/path/to/uGDS/build
-python dev-docs/bench_lmcache_e2e.py --backend ugds --device /dev/ugds_drv0
+python tests/v1/gpu_connector/bench_e2e.py --backend ugds --device /dev/ugds_drv0
 
 # cuFile GDS backend
-python dev-docs/bench_lmcache_e2e.py --backend cufile --slab-dir /mnt/ugds_test
+python tests/v1/gpu_connector/bench_e2e.py --backend cufile --slab-dir /mnt/ugds_test
 ```
 
 ## Tests
