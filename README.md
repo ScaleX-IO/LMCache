@@ -39,10 +39,14 @@ allocator, eviction) is unchanged.
 
 vLLM end-to-end on NVIDIA A100-SXM4-40GB + Samsung 990 PRO (PCIe Gen4 x4),
 cross-root-port P2P. Qwen3-0.6B, 256-token LMCache chunks, GDS L1 = 4 GiB,
-vLLM APC disabled, `max_tokens=1` (pure TTFT measurement). Each prompt uses
-unique token IDs to guarantee cold miss on first request; hot requests reuse
-the same prompt to guarantee cache hit. Sequential: 5 hot repeats, report
-p50. Concurrent: 1024 tokens/request, 3 rounds, report median.
+vLLM APC disabled, `max_tokens=1` (pure TTFT measurement).
+
+- **Sequential**: each prompt uses unique token IDs to guarantee a cold miss
+  on first request. After the STORE completes, the same prompt is sent 5
+  more times (cache hit); report TTFT p50.
+- **Concurrent**: each concurrency level (1/2/4/8) uses separate 1024-token
+  prompts, pre-warmed with a cold request. All requests then fire
+  concurrently for 3 rounds; report median throughput.
 
 ![Sequential TTFT](assets/lmcache_e2e_seq_ttft.png)
 
@@ -52,24 +56,27 @@ p50. Concurrent: 1024 tokens/request, 3 rounds, report median.
 
 ## Usage
 
-The only difference from the default cuFile GDS backend is two CLI flags
-when starting the LMCache server:
+After environment setup (see below), the only difference from the default
+cuFile GDS backend is two CLI flags and `LD_LIBRARY_PATH`:
 
 ```bash
 # cuFile GDS (default)
 lmcache server \
   --gds-l1-backend cufile \
-  --gds-l1-path /mnt/nvme
+  --gds-l1-path /mnt/nvme \
+  ...
 
 # uGDS
+export LD_LIBRARY_PATH=/path/to/uGDS/build:$LD_LIBRARY_PATH
 lmcache server \
   --gds-l1-backend ugds \
-  --gds-l1-path /dev/ugds_drv0
+  --gds-l1-path /dev/ugds_drv0 \
+  ...
 ```
 
-All other flags (`--chunk-size`, `--l1-size-gb`, `--eviction-policy`, etc.)
-and the vLLM side (`--kv-transfer-config`) remain the same. No code changes
-are needed in the application or vLLM launch command.
+All other server flags (`--chunk-size`, `--l1-size-gb`, `--eviction-policy`,
+etc.) and the vLLM side (`--kv-transfer-config`) remain the same. No code
+changes are needed in the application or vLLM launch command.
 
 ## Environment Setup
 
