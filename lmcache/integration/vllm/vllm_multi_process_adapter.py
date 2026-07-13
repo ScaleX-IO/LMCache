@@ -294,7 +294,7 @@ def send_ping(
         return False
 
 
-@dataclass
+@dataclass(init=False)
 class ParallelStrategy:
     use_mla: bool
     """Whether to use the MLA."""
@@ -316,6 +316,79 @@ class ParallelStrategy:
 
     n_servers: int
     """Number of LMCache servers backing this deployment"""
+
+    def __init__(
+        self,
+        use_mla: bool,
+        *args: int,
+        vllm_world_size: int | None = None,
+        vllm_worker_id: int | None = None,
+        tp_size: int | None = None,
+        pp_size: int | None = None,
+        n_servers: int | None = None,
+    ) -> None:
+        if args:
+            if any(
+                value is not None
+                for value in (
+                    vllm_world_size,
+                    vllm_worker_id,
+                    tp_size,
+                    pp_size,
+                    n_servers,
+                )
+            ):
+                raise TypeError(
+                    "ParallelStrategy does not accept mixed positional and "
+                    "keyword topology arguments"
+                )
+            if len(args) == 5:
+                (
+                    vllm_world_size,
+                    vllm_worker_id,
+                    tp_size,
+                    pp_size,
+                    n_servers,
+                ) = args
+            elif len(args) == 6:
+                (
+                    legacy_kv_world_size,
+                    _legacy_kv_worker_id,
+                    vllm_world_size,
+                    vllm_worker_id,
+                    tp_size,
+                    pp_size,
+                ) = args
+                if legacy_kv_world_size <= 0:
+                    raise ValueError("legacy kv_world_size must be positive")
+                if vllm_world_size % legacy_kv_world_size != 0:
+                    raise ValueError(
+                        "vllm_world_size must be divisible by legacy "
+                        "kv_world_size"
+                    )
+                n_servers = vllm_world_size // legacy_kv_world_size
+            else:
+                raise TypeError(
+                    "ParallelStrategy expects 5 current or 6 legacy "
+                    "topology arguments after use_mla"
+                )
+
+        values = (
+            vllm_world_size,
+            vllm_worker_id,
+            tp_size,
+            pp_size,
+            n_servers,
+        )
+        if any(value is None for value in values):
+            raise TypeError("ParallelStrategy topology arguments are required")
+
+        self.use_mla = use_mla
+        self.vllm_world_size = int(vllm_world_size)
+        self.vllm_worker_id = int(vllm_worker_id)
+        self.tp_size = int(tp_size)
+        self.pp_size = int(pp_size)
+        self.n_servers = int(n_servers)
 
     @property
     def kv_world_size(self) -> int:
@@ -560,20 +633,22 @@ LookupResult = int
 class LMCacheMPSchedulerAdapter:
     def __init__(
         self,
-        server_urls: list[str],
-        context: zmq.Context,
-        model_name: str,
-        vllm_block_size: int,
-        parallel_strategy: ParallelStrategy | int,
+        server_urls: list[str] | None = None,
+        context: zmq.Context | None = None,
+        model_name: str | None = None,
+        vllm_block_size: int | None = None,
+        parallel_strategy: ParallelStrategy | int | None = None,
         legacy_block_size: int | None = None,
         *,
+        server_url: str | None = None,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         extra_config: dict[str, Any] | None = None,
     ):
         """
         Args:
-            server_urls: The servers URL for the LMCache message queue
+            server_urls: The server URLs for the LMCache message queue.
+            server_url: A single server URL used by vLLM 0.20.1 connectors.
             context: The ZMQ context
             model_name: The model name used for LMCache keys
             vllm_block_size: The block size used in vLLM
@@ -591,6 +666,21 @@ class LMCacheMPSchedulerAdapter:
                 ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
                 provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
         """
+        if server_urls is not None and server_url is not None:
+            raise TypeError("Specify server_urls or server_url, not both")
+        if server_urls is None:
+            if server_url is None:
+                raise TypeError("server_urls or server_url is required")
+            server_urls = [server_url]
+        if context is None:
+            raise TypeError("context is required")
+        if model_name is None:
+            raise TypeError("model_name is required")
+        if vllm_block_size is None:
+            raise TypeError("vllm_block_size is required")
+        if parallel_strategy is None:
+            raise TypeError("parallel_strategy is required")
+
         vllm_block_size, parallel_strategy, mq_timeout = _normalize_adapter_init_args(
             vllm_block_size,
             parallel_strategy,
@@ -1218,6 +1308,19 @@ class LMCacheMPWorkerAdapter:
     def worker_id(self) -> int:
         """Get the kv worker id."""
         return self.parallel_strategy.kv_worker_id
+
+    @property
+    def use_mla(self) -> bool:
+        """Whether to use MLA."""
+        return self.parallel_strategy.use_mla
+
+    @property
+    def is_first_rank_of_pp_group(self) -> bool:
+        """Whether this worker is the first rank of its PP group."""
+        return (
+            self.parallel_strategy.vllm_worker_id % self.parallel_strategy.tp_size
+            == 0
+        )
 
     @property
     def is_kv_writer(self) -> bool:

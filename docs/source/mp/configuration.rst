@@ -240,6 +240,10 @@ The DMA path is selected automatically by platform: **cuFile**
 (``libcufile.so``) on NVIDIA and **hipFile** (``libhipfile.so``,
 `ROCm/hipFile <https://github.com/ROCm/hipFile>`_) on AMD ROCm. The same
 flags apply to both; no configuration change is needed to switch vendors.
+The optional **uGDS** backend uses a raw ``/dev/ugds_drvX`` device instead of
+a slab file. Because offsets map directly to disk LBAs, enabling uGDS
+overwrites data in the configured slab range and must only be used on a
+dedicated device.
 
 .. note::
 
@@ -258,13 +262,26 @@ flags apply to both; no configuration change is needed to switch vendors.
      - Description
    * - ``--gds-l1-path``
      - Not set
-     - NVMe directory for the GDS L1 slab. Setting this enables the GDS L1
-       tier; one shared slab per process lives at
-       ``<path>/lmcache_gds_slab.bin``.
+     - NVMe directory for the cuFile/hipFile slab, or a raw device such as
+       ``/dev/ugds_drv0`` when ``--gds-l1-backend=ugds``. Setting this enables
+       the GDS L1 tier.
+   * - ``--gds-l1-backend``
+     - ``auto``
+     - ``auto`` selects cuFile on CUDA and hipFile on ROCm. Set ``ugds`` to
+       use the uGDS raw-device backend.
    * - ``--gds-l1-use-direct-io`` / ``--no-gds-l1-use-direct-io``
      - ``True``
      - Open the slab with ``O_DIRECT`` (required for the GDS DMA fast path on
-       ext4).
+       ext4). Ignored by uGDS, which does not use a filesystem.
+
+For example, to dedicate an 8 GiB raw-device range to the uGDS L1 tier:
+
+.. code-block:: bash
+
+   lmcache server \
+     --l1-size-gb 8 \
+     --gds-l1-backend ugds \
+     --gds-l1-path /dev/ugds_drv0
 
 L1 Manager TTLs
 ----------------

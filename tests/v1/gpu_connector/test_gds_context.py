@@ -60,9 +60,33 @@ def _gds_available() -> bool:
     return os.path.exists("/proc/driver/nvidia-fs/stats")
 
 
+def _ugds_device() -> str | None:
+    """Return a bound uGDS raw device when the library is available."""
+    if not torch.cuda.is_available():
+        return None
+    device = next(
+        (path for index in range(4) if os.path.exists(path := f"/dev/ugds_drv{index}")),
+        None,
+    )
+    if device is None:
+        return None
+    # Standard
+    import ctypes
+
+    try:
+        ctypes.CDLL("libugds.so")
+    except OSError:
+        return None
+    return device
+
+
 requires_gds = pytest.mark.skipif(
     not _gds_available(),
     reason="needs CUDA + nvidia-fs or ROCm + libhipfile.so (real GPUDirect Storage)",
+)
+requires_ugds = pytest.mark.skipif(
+    _ugds_device() is None,
+    reason="needs CUDA + ugds_drv device + libugds.so",
 )
 
 
@@ -72,6 +96,7 @@ def _reset_singleton():
     get_gds_context.cache_clear()
     yield
     get_gds_context.cache_clear()
+    ca.select_backend("auto")
 
 
 class TestSingleton:
@@ -116,6 +141,47 @@ class TestRegisterGpuBuffer:
         ctx.register_gpu_buffer(buf)
 
         assert sizes == [16 << 20, 16 << 20, 8 << 20]
+
+
+class TestUgdsInitialization:
+    def test_raw_device_is_registered_without_file_operations(self, monkeypatch):
+        class FakeHandle:
+            def close(self):
+                return None
+
+        registered_paths = []
+        monkeypatch.setattr(ca, "select_backend", lambda name: "ugds")
+        monkeypatch.setattr(
+            ca,
+            "register_handle",
+            lambda path: registered_paths.append(path) or FakeHandle(),
+        )
+        monkeypatch.setattr(
+            os,
+            "makedirs",
+            lambda *args, **kwargs: pytest.fail(
+                "uGDS initialization must not create a directory"
+            ),
+        )
+        monkeypatch.setattr(
+            os,
+            "open",
+            lambda *args, **kwargs: pytest.fail(
+                "uGDS initialization must not open a slab file"
+            ),
+        )
+
+        ctx = GDSContext()
+        cfg = GdsL1Config(
+            file_location="/dev/ugds_drv7",
+            size_in_bytes=64 << 20,
+            backend="ugds",
+        )
+        ctx.initialize(cfg)
+
+        assert ctx.initialized is True
+        assert registered_paths == ["/dev/ugds_drv7"]
+        ctx.close()
 
 
 class TestResolveBuffer:
@@ -190,6 +256,47 @@ class TestPerStreamRegistration:
         ctx.deregister_gpu_buffer(buf_a)
         assert dereg_str == [22, 11]
         assert len(dereg_buf) == 3  # all three slots deregistered
+
+
+@requires_ugds
+def test_ugds_context_roundtrip():
+    """Round-trip a multi-region chunk through the LMCache uGDS L1 path."""
+    cfg = GdsL1Config(
+        file_location=_ugds_device() or "",
+        size_in_bytes=64 << 20,
+        backend="ugds",
+    )
+    chunk_bytes = 24 << 20
+    ctx = GDSContext()
+    ctx.initialize(cfg)
+    try:
+        buffer = torch.empty(chunk_bytes, dtype=torch.uint8, device="cuda")
+        ctx.register_gpu_buffer(buffer)
+        manager = GDSL1MemoryManager(cfg)
+        error, objects = manager.allocate(
+            MemoryLayoutDesc(
+                shapes=[torch.Size([chunk_bytes])],
+                dtypes=[torch.uint8],
+            ),
+            1,
+        )
+        assert error == L1Error.SUCCESS
+
+        expected = (torch.arange(chunk_bytes, dtype=torch.int64) % 251).to(torch.uint8)
+        buffer.copy_(expected.cuda())
+        torch.cuda.synchronize()
+        ctx.transfer_async(objects[0], buffer, SlabDirection.WRITE)
+        torch.cuda.synchronize()
+
+        buffer.zero_()
+        torch.cuda.synchronize()
+        ctx.transfer_async(objects[0], buffer, SlabDirection.READ)
+        torch.cuda.synchronize()
+
+        assert torch.equal(buffer.cpu(), expected)
+        ctx.deregister_gpu_buffer(buffer)
+    finally:
+        ctx.close()
 
 
 @requires_gds

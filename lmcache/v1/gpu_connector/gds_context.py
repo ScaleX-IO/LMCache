@@ -5,7 +5,7 @@ The actual GPU<->slab DMA goes through the platform GDS library -- cuFile on
 NVIDIA, hipFile on AMD ROCm -- reached via the :mod:`_gds_async` dispatch shim
 (imported here as ``ca``), so this module is platform-agnostic.
 
-One :class:`GDSContext` per worker process owns the slab file, its GDS handle,
+One :class:`GDSContext` per worker process owns the slab, its GDS handle,
 the registered GPU staging buffers, and the stream-ordered GDS submissions.
 Created once at startup by :func:`initialize_gds_context`, reached via
 :func:`get_gds_context`. :meth:`GDSContext.register_gpu_buffer` registers a
@@ -88,6 +88,7 @@ class GDSContext:
         # flipped to True by ``initialize``.
         self._slab_size = 0
         self._slab_path = ""
+        self._backend = ""
         self._slab_handle: Optional[ca.AsyncHandle] = None
         # Per-stream in-flight submissions (keyed by raw ``CUstream``), released
         # once a CUDA event recorded on that stream completes. Guarded by
@@ -106,9 +107,9 @@ class GDSContext:
 
         Args:
             config: GDS tier config. ``size_in_bytes`` sizes the preallocated
-                slab (rounded up to 4 KiB) at
-                ``<file_location>/lmcache_gds_slab.bin`` (one per process);
-                ``use_direct_io`` opens it with ``O_DIRECT``.
+                slab (rounded up to 4 KiB). cuFile/hipFile create
+                ``<file_location>/lmcache_gds_slab.bin``; uGDS maps the slab
+                directly onto the raw device at ``file_location``.
 
         Raises:
             Exception: Whatever the GDS library (cuFile/hipFile) raises if GDS
@@ -117,12 +118,16 @@ class GDSContext:
         self._slab_size = (config.size_in_bytes + _CUFILE_ALIGNMENT - 1) & ~(
             _CUFILE_ALIGNMENT - 1
         )
+        self._backend = ca.select_backend(config.backend)
 
         # One shared slab per process (the GDSContext is a process-global
         # singleton used by every GPU instance).
         selected = config.file_location
-        os.makedirs(selected, exist_ok=True)
-        self._slab_path = os.path.join(selected, _SLAB_FILENAME)
+        if self._backend == "ugds":
+            self._slab_path = selected
+        else:
+            os.makedirs(selected, exist_ok=True)
+            self._slab_path = os.path.join(selected, _SLAB_FILENAME)
 
         self._open_and_register_slab(config.use_direct_io)
         self.initialized = True
@@ -253,6 +258,15 @@ class GDSContext:
         Args:
             use_direct_io: Open with ``O_DIRECT`` (required for the GDS fast path).
         """
+        if self._backend == "ugds":
+            self._slab_handle = ca.register_handle(self._slab_path)
+            logger.info(
+                "GDSContext: uGDS raw-device slab opened at %s (%.1f GiB)",
+                self._slab_path,
+                self._slab_size / (1 << 30),
+            )
+            return
+
         # Create, truncate, and fallocate via a regular (non-O_DIRECT) fd.
         creator_fd = os.open(
             self._slab_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644

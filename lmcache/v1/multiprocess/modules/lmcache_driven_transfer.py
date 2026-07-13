@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from itertools import islice
 from typing import Generator, Sequence
+import os
 import threading
 import time
 
@@ -238,6 +239,7 @@ def transfer_kv_per_object_group(
     batch_size: int,
     skip_first_n_tokens: int,
     direction: "lmc_ops.TransferDirection",
+    profile_marks: list[tuple[str, torch.Event, torch.Event]] | None = None,
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -306,6 +308,14 @@ def transfer_kv_per_object_group(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
+        io_start = (
+            torch_dev.Event(enable_timing=True)
+            if profile_marks is not None and is_h2d
+            else None
+        )
+        if io_start is not None:
+            io_start.record()
+
         # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
         if is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
@@ -315,6 +325,17 @@ def transfer_kv_per_object_group(
                         chunk_idx, object_group_id
                     ),
                 )
+
+        if io_start is not None:
+            io_end = torch_dev.Event(enable_timing=True)
+            io_end.record()
+            profile_marks.append(("io", io_start, io_end))
+
+        gather_start = (
+            torch_dev.Event(enable_timing=True) if profile_marks is not None else None
+        )
+        if gather_start is not None:
+            gather_start.record()
 
         # Do paged KV copy
         for kernel_group_id in kernel_group_ids:
@@ -372,8 +393,20 @@ def transfer_kv_per_object_group(
                 recalculated_skip_blocks,
             )
 
+        if gather_start is not None:
+            gather_end = torch_dev.Event(enable_timing=True)
+            gather_end.record()
+            profile_marks.append(("gather", gather_start, gather_end))
+
         # For D2H, copy from GPU tmp buffers to CPU after the kernel launch
         if not is_h2d:
+            io_start = (
+                torch_dev.Event(enable_timing=True)
+                if profile_marks is not None
+                else None
+            )
+            if io_start is not None:
+                io_start.record()
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
                 lmcache_memcpy_async_d2h(
                     cache_context.get_temp_object_group_buffer(
@@ -381,6 +414,10 @@ def transfer_kv_per_object_group(
                     ),
                     memory_obj,
                 )
+            if io_start is not None:
+                io_end = torch_dev.Event(enable_timing=True)
+                io_end.record()
+                profile_marks.append(("io", io_start, io_end))
 
 
 @dataclass
@@ -749,6 +786,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             store completed without such a failure.
         """
         st = time.perf_counter()
+        profile_enabled = os.getenv("LMCACHE_GDS_PROFILE") == "1"
+        profile_marks: list[tuple[str, torch.Event, torch.Event]] | None = (
+            [] if profile_enabled else None
+        )
+        profile_cpu: dict[str, float] = {}
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -816,7 +858,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             vllm_event = torch_dev.Event.from_ipc_handle(
                 cache_context.device, event_ipc_handle
             )
+            producer_wait_start = (
+                torch_dev.Event(enable_timing=True) if profile_enabled else None
+            )
+            if producer_wait_start is not None:
+                producer_wait_start.record()
             vllm_event.wait(stream=cache_context.stream)
+            if producer_wait_start is not None:
+                producer_wait_end = torch_dev.Event(enable_timing=True)
+                producer_wait_end.record()
+                profile_marks.append(
+                    ("producer_wait", producer_wait_start, producer_wait_end)
+                )
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
@@ -848,6 +901,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             store_succeeded = False
             try:
                 for obj_group_id in range(num_object_groups):
+                    reserve_start = time.perf_counter()
                     obj_keys = obj_keys_per_obj_group[obj_group_id]
                     layout_desc = get_layout_desc(
                         cache_context,
@@ -856,6 +910,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                     reserved_dict = self._ctx.storage_manager.reserve_write(
                         obj_keys, layout_desc, "new"
+                    )
+                    profile_cpu["reserve"] = profile_cpu.get("reserve", 0.0) + (
+                        time.perf_counter() - reserve_start
                     )
                     all_dict.update(reserved_dict)
                     if reserved_dict:
@@ -870,6 +927,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     ]
 
                     # NOTE: batch_size must stay 1 for store.
+                    enqueue_start = time.perf_counter()
                     transfer_kv_per_object_group(
                         cache_context,
                         block_ids_per_group_gpu,
@@ -878,7 +936,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         batch_size=1,
                         skip_first_n_tokens=0,
                         direction=lmc_ops.TransferDirection.D2H,
+                        profile_marks=profile_marks,
                     )
+                    profile_cpu["transfer_enqueue"] = profile_cpu.get(
+                        "transfer_enqueue", 0.0
+                    ) + (time.perf_counter() - enqueue_start)
 
                 store_succeeded = True
             except Exception:
@@ -911,6 +973,33 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         },
                     ),
                 )
+
+                if profile_enabled and store_succeeded:
+                    sync_start = time.perf_counter()
+                    event.synchronize()
+                    profile_cpu["stream_sync"] = time.perf_counter() - sync_start
+                    gpu_ms: dict[str, float] = {}
+                    assert profile_marks is not None
+                    for name, start_event, end_event in profile_marks:
+                        gpu_ms[name] = gpu_ms.get(name, 0.0) + start_event.elapsed_time(
+                            end_event
+                        )
+                    logger.info(
+                        "GDS_PROFILE request_id=%s chunks=%d bytes=%d "
+                        "cpu_reserve_ms=%.3f cpu_enqueue_ms=%.3f "
+                        "cpu_sync_ms=%.3f gpu_producer_wait_ms=%.3f "
+                        "gpu_gather_ms=%.3f gpu_io_ms=%.3f total_store_ms=%.3f",
+                        key.request_id,
+                        num_chunks,
+                        total_bytes,
+                        profile_cpu.get("reserve", 0.0) * 1000,
+                        profile_cpu.get("transfer_enqueue", 0.0) * 1000,
+                        profile_cpu.get("stream_sync", 0.0) * 1000,
+                        gpu_ms.get("producer_wait", 0.0),
+                        gpu_ms.get("gather", 0.0),
+                        gpu_ms.get("io", 0.0),
+                        (time.perf_counter() - st) * 1000,
+                    )
 
         ed = time.perf_counter()
         if stored_count:

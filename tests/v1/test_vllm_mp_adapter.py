@@ -20,6 +20,7 @@ import torch
 from lmcache.integration.vllm import vllm_multi_process_adapter as adapter_mod
 from lmcache.integration.vllm.vllm_multi_process_adapter import (
     HeartbeatThread,
+    LMCacheMPSchedulerAdapter,
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
@@ -115,6 +116,57 @@ def _make_worker_adapter(
         mq_timeout=5.0,
         extra_config=extra_config,
     )
+
+
+def test_parallel_strategy_accepts_vllm_0201_signature():
+    strategy = ParallelStrategy(False, 2, 1, 4, 3, 4, 1)
+
+    assert strategy.vllm_world_size == 4
+    assert strategy.vllm_worker_id == 3
+    assert strategy.n_servers == 2
+    assert strategy.kv_world_size == 2
+    assert strategy.kv_worker_id == 1
+
+
+def test_parallel_strategy_accepts_current_positional_signature():
+    strategy = ParallelStrategy(False, 4, 3, 4, 1, 2)
+
+    assert strategy.vllm_world_size == 4
+    assert strategy.vllm_worker_id == 3
+    assert strategy.n_servers == 2
+    assert strategy.kv_world_size == 2
+    assert strategy.kv_worker_id == 1
+
+
+def test_scheduler_adapter_accepts_vllm_0201_server_url(monkeypatch):
+    monkeypatch.setattr(adapter_mod, "MessageQueueClient", MagicMock)
+    monkeypatch.setattr(
+        adapter_mod,
+        "get_lmcache_chunk_size",
+        lambda *args, **kwargs: 256,
+    )
+    strategy = ParallelStrategy(False, 1, 0, 1, 1, 1, 1)
+
+    adapter = LMCacheMPSchedulerAdapter(
+        server_url="tcp://127.0.0.1:6555",
+        context=MagicMock(),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=strategy,
+    )
+
+    assert adapter._server_urls == ["tcp://127.0.0.1:6555"]
+
+
+def test_worker_adapter_exposes_vllm_0201_mla_properties():
+    adapter = LMCacheMPWorkerAdapter.__new__(LMCacheMPWorkerAdapter)
+    adapter.parallel_strategy = ParallelStrategy(True, 2, 1, 4, 2, 2, 1)
+
+    assert adapter.use_mla is True
+    assert adapter.is_first_rank_of_pp_group is True
+
+    adapter.parallel_strategy = ParallelStrategy(True, 2, 1, 4, 3, 2, 1)
+    assert adapter.is_first_rank_of_pp_group is False
 
 
 def _op(block_ids: list[list[int]]) -> LoadStoreOp:
