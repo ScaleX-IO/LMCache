@@ -73,3 +73,55 @@ python tests/v1/gpu_connector/bench_chunk_read.py gds-context   # via GDSContext
 
 Iteration count and pipeline depths are tunable via `LMCACHE_BENCH_ITERS`,
 `LMCACHE_BENCH_WARMUP`, and `LMCACHE_BENCH_DEPTHS`.
+
+## Performance
+
+All benchmarks below were collected on NVIDIA A100-SXM4-40GB + Samsung 990 PRO
+(PCIe Gen4 x4), with the disk freshly formatted between backend switches. GPU
+and SSD are on different PCIe root complexes (cross-root-port P2P).
+
+### IO-level: Async Read/Write (4K--1M, depth=1)
+
+![IO Bandwidth](assets/lmcache_gds_vs_ugds_bandwidth.png)
+
+![IO Latency](assets/lmcache_gds_vs_ugds_latency.png)
+
+uGDS read latency is 14x lower at 4K and stays under 203 us at 1M (vs 49 ms
+for cuFile). Read bandwidth reaches 5 GB/s at 512K; write bandwidth reaches
+5 GB/s at 1M.
+
+### KV cache read: 32MB chunks (Llama3-8B fp16, 256 tokens/chunk)
+
+![Chunk Read](assets/lmcache_chunk_read_comparison.png)
+
+Through the full `GDSContext` path (allocator + region registration + async
+transfer), uGDS sustains ~5.9 GB/s vs ~2.7 GB/s for cuFile -- a consistent
+2.1x speedup across pipeline depths 1--16.
+
+### vLLM end-to-end: cache-hit TTFT and throughput
+
+Model: Qwen3-0.6B, 256-token LMCache chunks, GDS L1 = 4 GiB, APC disabled,
+`max_tokens=1` (pure TTFT measurement).
+
+![E2E Benchmark](assets/lmcache-gds-ugds-benchmark.png)
+
+**Sequential cache-hit (unique prompts, 5 hot repeats, p50):**
+
+| Tokens | cuFile TTFT p50 (ms) | uGDS TTFT p50 (ms) | Speedup |
+|-------:|---------------------:|--------------------:|--------:|
+| 256 | 26.2 | 19.2 | 1.4x |
+| 512 | 36.7 | 24.7 | 1.5x |
+| 1024 | 60.2 | 35.5 | 1.7x |
+| 2048 | 105.9 | 58.2 | 1.8x |
+| 3840 | 185.3 | 94.3 | 2.0x |
+
+**Concurrent cache-hit (1024 tokens/request, 3 rounds, median):**
+
+| Concurrency | cuFile throughput (kTok/s) | uGDS throughput (kTok/s) | cuFile TTFT p95 (ms) | uGDS TTFT p95 (ms) |
+|------------:|--------------------------:|-------------------------:|---------------------:|-------------------:|
+| 1 | 16.6 | 27.3 | 60.8 | 36.5 |
+| 2 | 18.1 | 33.2 | 64.8 | 38.2 |
+| 4 | 20.4 | 39.1 | 154.2 | 82.8 |
+| 8 | 21.7 | 44.5 | 325.8 | 156.3 |
+
+At concurrency 8, uGDS delivers 2.1x throughput and 52% lower TTFT p95.
