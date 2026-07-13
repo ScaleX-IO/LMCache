@@ -366,7 +366,13 @@ class ParallelStrategy:
                         "vllm_world_size must be divisible by legacy "
                         "kv_world_size"
                     )
-                n_servers = vllm_world_size // legacy_kv_world_size
+                # The legacy 6-argument convention comes from vLLM 0.20.1's
+                # built-in MP connector, which predates multi-server support
+                # and always runs against a single LMCache server. Deriving
+                # n_servers as vllm_world_size // legacy_kv_world_size would
+                # be wrong under MLA, where legacy_kv_world_size is
+                # world_size // tp_size rather than the server count.
+                n_servers = 1
             else:
                 raise TypeError(
                     "ParallelStrategy expects 5 current or 6 legacy "

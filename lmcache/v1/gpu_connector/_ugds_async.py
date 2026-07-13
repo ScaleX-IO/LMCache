@@ -7,8 +7,9 @@ register_*/deregister_*) is identical so that :mod:`gds_context` can use
 either backend transparently.
 
 uGDS operates on raw block devices (/dev/ugds_drv*), not filesystem files.
-Where _cufile_async opens a file fd, this module opens a uGDS device and
-registers an NVMe handle.
+The fd/handle split is the same as _cufile_async: the caller opens the
+device (O_RDWR, no O_DIRECT since uGDS IO bypasses the kernel), passes the
+fd to register_handle, and wraps the pair via AsyncHandle.from_fd.
 """
 
 # Standard
@@ -150,33 +151,32 @@ def close_driver() -> None:
 
 # --- Handle registration --------------------------------------------
 
-def register_handle(device_path: str) -> "AsyncHandle":
-    """Open a uGDS device and return an AsyncHandle.
+def register_handle(fd: int) -> int:
+    """Register an open uGDS device fd and return the raw uGDSHandle_t.
 
-    Unlike _cufile_async.register_handle(fd), this takes a device path
-    (e.g. "/dev/ugds_drv0") because uGDS operates on raw block devices.
+    Mirrors _cufile_async.register_handle(fd): the caller owns the fd
+    (typically an O_RDWR open of /dev/ugds_drvX) and closes it on
+    registration failure; wrap the pair via AsyncHandle.from_fd.
     """
     _ensure_driver_open()
-    fd = os.open(device_path, os.O_RDWR)
     lib = _get_lib()
     handle = ctypes.c_void_p()
     descr = _uGDSDescr_t()
     descr.type = _UGDS_HANDLE_TYPE_OPAQUE_FD
     descr.handle.fd = fd
-    try:
-        _check(
-            lib.uGDSHandleRegister(ctypes.byref(handle), ctypes.byref(descr)),
-            "uGDSHandleRegister",
-        )
-    except Exception:
-        os.close(fd)
-        raise
-    return AsyncHandle._from_parts(fd, handle.value, device_path)
+    _check(
+        lib.uGDSHandleRegister(ctypes.byref(handle), ctypes.byref(descr)),
+        "uGDSHandleRegister",
+    )
+    if handle.value is None:
+        raise RuntimeError("uGDSHandleRegister returned a null handle")
+    return handle.value
 
 
-def deregister_handle(handle: "AsyncHandle") -> None:
+def deregister_handle(handle: int) -> None:
+    """Reverse of register_handle (uGDSHandleDeregister)."""
     lib = _get_lib()
-    lib.uGDSHandleDeregister(ctypes.c_void_p(handle._handle))
+    lib.uGDSHandleDeregister(ctypes.c_void_p(handle))
 
 
 # --- Buffer / stream registration -----------------------------------
@@ -255,37 +255,35 @@ class AsyncHandle:
         device_path: str,
         writable: bool = True,
     ) -> None:
-        handle_obj = register_handle(device_path)
-        self._fd = handle_obj._fd
-        self._handle = handle_obj._handle
-        self.path = handle_obj.path
+        fd = os.open(device_path, os.O_RDWR)
+        try:
+            handle = register_handle(fd)
+        except Exception:
+            os.close(fd)
+            raise
+        self._fd = fd
+        self._handle = handle
+        self.path = device_path
         self.writable = writable
 
     @classmethod
-    def _from_parts(
+    def from_fd(
         cls,
         fd: int,
         handle: int,
         path: str,
-        writable: bool = True,
+        writable: bool = False,
     ) -> "AsyncHandle":
+        """Wrap an already-opened fd and registered uGDS handle.
+
+        Matches _cufile_async.AsyncHandle.from_fd.
+        """
         obj = cls.__new__(cls)
         obj._fd = fd
         obj._handle = handle
         obj.path = path
         obj.writable = writable
         return obj
-
-    @classmethod
-    def from_fd(
-        cls,
-        fd: int,
-        handle: Any,
-        path: str,
-        writable: bool = False,
-    ) -> "AsyncHandle":
-        """Compat shim matching _cufile_async.AsyncHandle.from_fd."""
-        return cls._from_parts(fd, handle, path, writable)
 
     @property
     def fd(self) -> int:
@@ -342,9 +340,8 @@ class AsyncHandle:
     def close(self) -> None:
         if self._fd < 0:
             return
-        lib = _get_lib()
         try:
-            lib.uGDSHandleDeregister(ctypes.c_void_p(self._handle))
+            deregister_handle(self._handle)
         finally:
             try:
                 os.close(self._fd)

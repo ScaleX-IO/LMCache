@@ -5,7 +5,7 @@ Compare async read latency/BW at sizes below and above the 8MB threshold,
 at depth=1 (single IO) to isolate the parallel_io split effect.
 """
 
-import importlib
+import importlib.util
 import os
 import time
 import torch

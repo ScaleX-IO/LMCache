@@ -21,7 +21,7 @@ Results are printed as a table and saved to bench_results_{backend}.json.
 
 import argparse
 import ctypes
-import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -123,7 +123,9 @@ def run_ugds():
 
     device_path = find_ugds_device()
     print(f"uGDS device: {device_path}")
-    handle = ua.register_handle(device_path)
+    fd = os.open(device_path, os.O_RDWR)
+    ugds_handle = ua.register_handle(fd)
+    handle = ua.AsyncHandle.from_fd(fd, ugds_handle, device_path, writable=True)
 
     max_total = max(SIZES) * max(DEPTHS)
     stream = torch.cuda.current_stream()

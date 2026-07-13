@@ -253,32 +253,33 @@ class GDSContext:
     # --- Internal -----------------------------------------------------
 
     def _open_and_register_slab(self, use_direct_io: bool) -> None:
-        """Create, truncate, preallocate the slab file and register it with GDS.
+        """Open the slab and register it with the GDS backend.
+
+        cuFile/hipFile: create, truncate, and preallocate the slab file,
+        then open it (optionally with ``O_DIRECT``) and register the fd.
+        uGDS: open the existing raw block device directly; there is nothing
+        to create or preallocate, and ``O_DIRECT`` does not apply because
+        uGDS IO bypasses the kernel.
 
         Args:
-            use_direct_io: Open with ``O_DIRECT`` (required for the GDS fast path).
+            use_direct_io: Open with ``O_DIRECT`` (cuFile/hipFile only;
+                required for the GDS fast path).
         """
         if self._backend == "ugds":
-            self._slab_handle = ca.register_handle(self._slab_path)
-            logger.info(
-                "GDSContext: uGDS raw-device slab opened at %s (%.1f GiB)",
-                self._slab_path,
-                self._slab_size / (1 << 30),
+            fd = os.open(self._slab_path, os.O_RDWR)
+        else:
+            # Create, truncate, and fallocate via a regular (non-O_DIRECT) fd.
+            creator_fd = os.open(
+                self._slab_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644
             )
-            return
-
-        # Create, truncate, and fallocate via a regular (non-O_DIRECT) fd.
-        creator_fd = os.open(
-            self._slab_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644
-        )
-        try:
-            os.posix_fallocate(creator_fd, 0, self._slab_size)
-        finally:
-            os.close(creator_fd)
-        flags = os.O_RDWR
-        if use_direct_io:
-            flags |= os.O_DIRECT
-        fd = os.open(self._slab_path, flags)
+            try:
+                os.posix_fallocate(creator_fd, 0, self._slab_size)
+            finally:
+                os.close(creator_fd)
+            flags = os.O_RDWR
+            if use_direct_io:
+                flags |= os.O_DIRECT
+            fd = os.open(self._slab_path, flags)
         try:
             handle = ca.register_handle(fd)
         except Exception:
@@ -287,13 +288,20 @@ class GDSContext:
         self._slab_handle = ca.AsyncHandle.from_fd(
             fd, handle, self._slab_path, writable=True
         )
-        logger.info(
-            "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), GDS "
-            "handle registered",
-            self._slab_path,
-            self._slab_size / (1 << 30),
-            use_direct_io,
-        )
+        if self._backend == "ugds":
+            logger.info(
+                "GDSContext: uGDS raw-device slab opened at %s (%.1f GiB)",
+                self._slab_path,
+                self._slab_size / (1 << 30),
+            )
+        else:
+            logger.info(
+                "GDSContext: slab created at %s (%.1f GiB, O_DIRECT=%s), GDS "
+                "handle registered",
+                self._slab_path,
+                self._slab_size / (1 << 30),
+                use_direct_io,
+            )
 
     def _register_region_locked(self, buffer: torch.Tensor) -> None:
         """GDS-register one <=16 MiB region (caller holds the lock)."""

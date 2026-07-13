@@ -260,6 +260,12 @@ def transfer_kv_per_object_group(
             the retrieve range. This avoids overwriting APC-shared GPU blocks that
             may be read concurrently by other requests.
         direction: The transfer direction, H2D (retrieve) or D2H (store).
+        profile_marks: Mutable list collecting GPU timing marks as
+            ``(name, start_event, end_event)`` tuples recorded on the current
+            stream: ``"gather"`` around the paged KV copy kernels and, for
+            D2H, ``"io"`` around the memory object copy enqueue. The caller
+            owns the list and must synchronize the stream before reading
+            elapsed times. None disables profiling.
 
     Raises:
         ValueError: If it founds None entry in memory_objs when direction is H2D.
@@ -308,14 +314,6 @@ def transfer_kv_per_object_group(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
-        io_start = (
-            torch_dev.Event(enable_timing=True)
-            if profile_marks is not None and is_h2d
-            else None
-        )
-        if io_start is not None:
-            io_start.record()
-
         # For H2D, copy from CPU to GPU tmp buffers before the kernel launch
         if is_h2d:
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
@@ -325,11 +323,6 @@ def transfer_kv_per_object_group(
                         chunk_idx, object_group_id
                     ),
                 )
-
-        if io_start is not None:
-            io_end = torch_dev.Event(enable_timing=True)
-            io_end.record()
-            profile_marks.append(("io", io_start, io_end))
 
         gather_start = (
             torch_dev.Event(enable_timing=True) if profile_marks is not None else None
@@ -974,12 +967,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     ),
                 )
 
-                if profile_enabled and store_succeeded:
+                if profile_marks is not None and store_succeeded:
                     sync_start = time.perf_counter()
                     event.synchronize()
                     profile_cpu["stream_sync"] = time.perf_counter() - sync_start
                     gpu_ms: dict[str, float] = {}
-                    assert profile_marks is not None
                     for name, start_event, end_event in profile_marks:
                         gpu_ms[name] = gpu_ms.get(name, 0.0) + start_event.elapsed_time(
                             end_event

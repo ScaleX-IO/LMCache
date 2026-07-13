@@ -10,8 +10,11 @@ skipped unless that stack is present (see :func:`_gds_available`).
 """
 
 # Standard
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 import os
+import tempfile
 
 # Third Party
 import pytest
@@ -90,6 +93,82 @@ requires_ugds = pytest.mark.skipif(
 )
 
 
+def _skip_unless_gds_registrable(directory: Path) -> None:
+    """Skip the calling test when ``directory`` cannot back a GDS slab file.
+
+    Creates a small preallocated file in ``directory``, opens it with
+    ``O_DIRECT``, and registers it with the GDS driver, mirroring how
+    ``GDSContext`` opens its slab. Registration fails on filesystems the
+    driver does not support; on NVIDIA, nvidia-fs rejects files on
+    device-mapper volumes (LVM) with cuFile error 5008 whenever cuFile compat
+    mode is disabled.
+
+    Args:
+        directory: The directory in which the roundtrip test would place the
+            GDS slab file.
+    """
+    probe_path = directory / ".gds_registration_probe"
+    try:
+        fd = os.open(probe_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            os.posix_fallocate(fd, 0, 4096)
+        finally:
+            os.close(fd)
+        fd = os.open(probe_path, os.O_RDWR | os.O_DIRECT)
+        try:
+            handle = ca.register_handle(fd)
+            ca.deregister_handle(handle)
+        finally:
+            os.close(fd)
+    except (OSError, RuntimeError) as exc:
+        # OSError: open/fallocate; RuntimeError: cufile/hipfile registration.
+        pytest.skip(
+            f"GDS driver cannot register files under {directory} ({exc}); "
+            "point LMCACHE_GDS_TEST_DIR at a GDS-capable filesystem"
+        )
+    finally:
+        probe_path.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def gds_slab_dir(tmp_path: Path) -> Iterator[Path]:
+    """Directory holding the GDS slab file for the real-DMA roundtrip tests.
+
+    On NVIDIA the directory must be named explicitly via the
+    ``LMCACHE_GDS_TEST_DIR`` environment variable, pointing at a GDS-capable
+    filesystem (e.g. ext4 on a directly attached NVMe device); otherwise the
+    roundtrip tests are skipped. pytest's ``tmp_path`` is deliberately not
+    used as a fallback: it lives on the OS disk rather than a data disk set
+    up for GDS, and OS disks commonly use LVM/device-mapper volumes that
+    nvidia-fs cannot register, where cuFile either fails with error 5008 or,
+    with compat mode enabled, silently falls back to POSIX IO, so a passing
+    test would not have exercised the DMA path it claims to.
+
+    On AMD ROCm ``tmp_path`` is used when the variable is unset: per
+    :func:`_gds_available`, library loadability is a sufficient gate for
+    these correctness checks because the hipFile host-bounce fallback still
+    round-trips correctly, so no GDS-capable filesystem is required.
+
+    The resolved directory is probed with a small registration first and the
+    test is skipped, rather than failed, when the driver rejects it.
+    """
+    override = os.environ.get("LMCACHE_GDS_TEST_DIR", "")
+    if not override:
+        if torch.version.hip is None:
+            pytest.skip(
+                "set LMCACHE_GDS_TEST_DIR to a directory on a GDS-capable "
+                "filesystem to run the real-DMA roundtrip tests (pytest's "
+                "tmp_path may silently use the POSIX compat fallback)"
+            )
+        _skip_unless_gds_registrable(tmp_path)
+        yield tmp_path
+        return
+    with tempfile.TemporaryDirectory(dir=override, prefix="lmcache_gds_test_") as d:
+        slab_dir = Path(d)
+        _skip_unless_gds_registrable(slab_dir)
+        yield slab_dir
+
+
 @pytest.fixture(autouse=True)
 def _reset_singleton():
     """Drop the process-global GDSContext between tests."""
@@ -145,17 +224,30 @@ class TestRegisterGpuBuffer:
 
 class TestUgdsInitialization:
     def test_raw_device_is_registered_without_file_operations(self, monkeypatch):
-        class FakeHandle:
+        # Arbitrary fake device path; everything below is mocked. The asserts
+        # reuse it to verify file_location is passed through verbatim (the
+        # file backends would append a slab filename instead).
+        device = "/dev/ugds_drv7"
+        opened: list[tuple[str, int]] = []
+        registered_fds: list[int] = []
+        wrapped: list[tuple[int, int, str]] = []
+
+        class FakeAsyncHandle:
+            @classmethod
+            def from_fd(cls, fd, handle, path, writable=False):
+                wrapped.append((fd, handle, path))
+                return cls()
+
             def close(self):
                 return None
 
-        registered_paths = []
         monkeypatch.setattr(ca, "select_backend", lambda name: "ugds")
         monkeypatch.setattr(
             ca,
             "register_handle",
-            lambda path: registered_paths.append(path) or FakeHandle(),
+            lambda fd: registered_fds.append(fd) or 0xBEEF,
         )
+        monkeypatch.setattr(ca, "AsyncHandle", FakeAsyncHandle)
         monkeypatch.setattr(
             os,
             "makedirs",
@@ -165,22 +257,30 @@ class TestUgdsInitialization:
         )
         monkeypatch.setattr(
             os,
-            "open",
+            "posix_fallocate",
             lambda *args, **kwargs: pytest.fail(
-                "uGDS initialization must not open a slab file"
+                "uGDS initialization must not preallocate a slab file"
             ),
+        )
+        monkeypatch.setattr(
+            os, "open", lambda path, flags, *args: opened.append((path, flags)) or 33
         )
 
         ctx = GDSContext()
         cfg = GdsL1Config(
-            file_location="/dev/ugds_drv7",
+            file_location=device,
             size_in_bytes=64 << 20,
             backend="ugds",
         )
         ctx.initialize(cfg)
 
         assert ctx.initialized is True
-        assert registered_paths == ["/dev/ugds_drv7"]
+        # The raw device is opened O_RDWR exactly once: no O_CREAT/O_TRUNC
+        # (nothing to create or truncate) and no O_DIRECT (uGDS IO bypasses
+        # the kernel).
+        assert opened == [(device, os.O_RDWR)]
+        assert registered_fds == [33]
+        assert wrapped == [(33, 0xBEEF, device)]
         ctx.close()
 
 
@@ -300,10 +400,10 @@ def test_ugds_context_roundtrip():
 
 
 @requires_gds
-def test_gds_two_stream_write_read(tmp_path):
+def test_gds_two_stream_write_read(gds_slab_dir: Path):
     """Two CUDA streams each register their own buffer and round-trip a chunk
     through real cuFile DMA; verify the data stays isolated per stream."""
-    cfg = GdsL1Config(file_location=str(tmp_path), size_in_bytes=64 << 20)
+    cfg = GdsL1Config(file_location=str(gds_slab_dir), size_in_bytes=64 << 20)
     chunk_bytes = 8 << 20
     ctx = GDSContext()
     ctx.initialize(cfg)
@@ -356,9 +456,9 @@ def test_gds_two_stream_write_read(tmp_path):
 
 
 @requires_gds
-def test_gds_write_read_roundtrip(tmp_path):
+def test_gds_write_read_roundtrip(gds_slab_dir: Path):
     """Cold write then read of a chunk through the real cuFile DMA path."""
-    cfg = GdsL1Config(file_location=str(tmp_path), size_in_bytes=64 << 20)
+    cfg = GdsL1Config(file_location=str(gds_slab_dir), size_in_bytes=64 << 20)
     ctx = GDSContext()
     ctx.initialize(cfg)
     try:
@@ -390,13 +490,13 @@ def test_gds_write_read_roundtrip(tmp_path):
 
 
 @requires_gds
-def test_gds_chunk_larger_than_region_roundtrip(tmp_path):
+def test_gds_chunk_larger_than_region_roundtrip(gds_slab_dir: Path):
     """A chunk larger than the 16 MiB cuFile region cap round-trips correctly.
 
     Exercises the multi-region registration and the split (per-segment) DMA
     path: a 24 MiB chunk is registered/transferred as a 16 MiB + 8 MiB pair.
     """
-    cfg = GdsL1Config(file_location=str(tmp_path), size_in_bytes=64 << 20)
+    cfg = GdsL1Config(file_location=str(gds_slab_dir), size_in_bytes=64 << 20)
     ctx = GDSContext()
     ctx.initialize(cfg)
     try:

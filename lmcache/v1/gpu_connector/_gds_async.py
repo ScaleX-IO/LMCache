@@ -20,10 +20,21 @@ from typing import TYPE_CHECKING, Literal
 # Third Party
 import torch
 
-# A static type checker analyzes the TYPE_CHECKING branch only (one ``_backend``
-# binding, so no ``no-redef``); at runtime the ``elif``/``else`` pick the real
-# backend by platform.
 BackendName = Literal["auto", "cufile", "hipfile", "ugds"]
+
+# The backend surface re-exported under stable module-level names so callers
+# (and test monkeypatches) target this module.
+_EXPORTED_NAMES = (
+    "AsyncHandle",
+    "Submission",
+    "close_driver",
+    "register_handle",
+    "deregister_handle",
+    "register_buffer",
+    "deregister_buffer",
+    "register_stream",
+    "deregister_stream",
+)
 
 
 def _load_backend(name: BackendName) -> tuple[str, ModuleType]:
@@ -44,11 +55,30 @@ def _load_backend(name: BackendName) -> tuple[str, ModuleType]:
     return selected, backend
 
 
+def _bind_backend_surface(backend: ModuleType) -> None:
+    """Rebind every exported name to the given backend module."""
+    for name in _EXPORTED_NAMES:
+        globals()[name] = getattr(backend, name)
+
+
 if TYPE_CHECKING:
+    # Static surface for type checkers; every backend exposes the same names.
     # First Party
     from lmcache.v1.gpu_connector import _cufile_async as _backend
+    from lmcache.v1.gpu_connector._cufile_async import (
+        AsyncHandle as AsyncHandle,
+        Submission as Submission,
+        close_driver as close_driver,
+        deregister_buffer as deregister_buffer,
+        deregister_handle as deregister_handle,
+        deregister_stream as deregister_stream,
+        register_buffer as register_buffer,
+        register_handle as register_handle,
+        register_stream as register_stream,
+    )
 else:
     _selected_backend, _backend = _load_backend("auto")
+    _bind_backend_surface(_backend)
 
 
 def select_backend(name: BackendName) -> str:
@@ -62,37 +92,7 @@ def select_backend(name: BackendName) -> str:
     """
     global _backend
     global _selected_backend
-    global AsyncHandle
-    global Submission
-    global close_driver
-    global register_handle
-    global deregister_handle
-    global register_buffer
-    global deregister_buffer
-    global register_stream
-    global deregister_stream
 
     _selected_backend, _backend = _load_backend(name)
-    AsyncHandle = _backend.AsyncHandle
-    Submission = _backend.Submission
-    close_driver = _backend.close_driver
-    register_handle = _backend.register_handle
-    deregister_handle = _backend.deregister_handle
-    register_buffer = _backend.register_buffer
-    deregister_buffer = _backend.deregister_buffer
-    register_stream = _backend.register_stream
-    deregister_stream = _backend.deregister_stream
+    _bind_backend_surface(_backend)
     return _selected_backend
-
-
-# Re-export the selected backend's surface under stable names so callers
-# (and test monkeypatches) target this module.
-AsyncHandle = _backend.AsyncHandle
-Submission = _backend.Submission
-close_driver = _backend.close_driver
-register_handle = _backend.register_handle
-deregister_handle = _backend.deregister_handle
-register_buffer = _backend.register_buffer
-deregister_buffer = _backend.deregister_buffer
-register_stream = _backend.register_stream
-deregister_stream = _backend.deregister_stream

@@ -5,7 +5,7 @@ Pre-fill uses POSIX writes (avoids cuFileWriteAsync state pollution).
 Tests single-IO and pipeline modes to match LMCache gds_context usage.
 """
 
-import importlib
+import importlib.util
 import os
 import time
 import torch
@@ -298,7 +298,9 @@ def run_ugds():
     device_path = find_ugds_device()
     print(f"uGDS device: {device_path}")
 
-    handle = ua.register_handle(device_path)
+    fd = os.open(device_path, os.O_RDWR)
+    ugds_handle = ua.register_handle(fd)
+    handle = ua.AsyncHandle.from_fd(fd, ugds_handle, device_path, writable=True)
     buffers = [
         torch.empty(CHUNK, dtype=torch.uint8, device="cuda") for _ in range(max(DEPTHS))
     ]

@@ -10,7 +10,7 @@ Run standalone:
 
 # Standard
 import ctypes
-import importlib
+import importlib.util
 import os
 import sys
 
@@ -98,7 +98,13 @@ class TestUgdsRoundtrip:
     def test_write_read_4kb(self):
         ua = _load_ugds_async()
         device_path = self._find_device()
-        handle = ua.register_handle(device_path)
+        fd = os.open(device_path, os.O_RDWR)
+        try:
+            ugds_handle = ua.register_handle(fd)
+        except Exception:
+            os.close(fd)
+            raise
+        handle = ua.AsyncHandle.from_fd(fd, ugds_handle, device_path, writable=True)
         try:
             size = 4096
             buf = torch.empty(size, dtype=torch.uint8, device="cuda")
