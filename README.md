@@ -50,6 +50,27 @@ p50. Concurrent: 1024 tokens/request, 3 rounds, report median.
 
 ![Speedup](assets/lmcache_e2e_speedup.png)
 
+## Usage
+
+The only difference from the default cuFile GDS backend is two CLI flags
+when starting the LMCache server:
+
+```bash
+# cuFile GDS (default)
+lmcache server \
+  --gds-l1-backend cufile \
+  --gds-l1-path /mnt/nvme
+
+# uGDS
+lmcache server \
+  --gds-l1-backend ugds \
+  --gds-l1-path /dev/ugds_drv0
+```
+
+All other flags (`--chunk-size`, `--l1-size-gb`, `--eviction-policy`, etc.)
+and the vLLM side (`--kv-transfer-config`) remain the same. No code changes
+are needed in the application or vLLM launch command.
+
 ## Environment Setup
 
 Requirements: NVIDIA GPU with CUDA, an NVMe SSD dedicated to uGDS, the
