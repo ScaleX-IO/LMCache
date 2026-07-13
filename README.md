@@ -37,31 +37,12 @@ allocator, eviction) is unchanged.
 
 ## Performance
 
-All benchmarks on NVIDIA A100-SXM4-40GB + Samsung 990 PRO (PCIe Gen4 x4).
-Disk freshly formatted between backend switches. GPU and SSD on different
-PCIe root complexes (cross-root-port P2P).
-
-### LMCache IO-level (4K--1M, pipeline depth=1)
-
-![IO Bandwidth](assets/lmcache_gds_vs_ugds_bandwidth.png)
-
-![IO Latency](assets/lmcache_gds_vs_ugds_latency.png)
-
-### LMCache KV cache read (32MB/chunk, Llama3-8B fp16)
-
-![Chunk Read](assets/lmcache_chunk_read_comparison.png)
-
-Through the full `GDSContext` path (allocator + region registration +
-async transfer), uGDS sustains ~5.9 GB/s vs ~2.7 GB/s for cuFile -- a
-consistent **2.1x** speedup across pipeline depths 1--16.
-
-### vLLM end-to-end (Qwen3-0.6B, A100)
-
-Qwen3-0.6B, 256-token LMCache chunks, GDS L1 = 4 GiB, vLLM APC disabled,
-`max_tokens=1` (pure TTFT measurement). Each prompt uses unique token IDs
-to guarantee cold miss on first request; hot requests reuse the same prompt
-to guarantee cache hit. Sequential: 5 hot repeats, report p50. Concurrent:
-1024 tokens/request, 3 rounds, report median.
+vLLM end-to-end on NVIDIA A100-SXM4-40GB + Samsung 990 PRO (PCIe Gen4 x4),
+cross-root-port P2P. Qwen3-0.6B, 256-token LMCache chunks, GDS L1 = 4 GiB,
+vLLM APC disabled, `max_tokens=1` (pure TTFT measurement). Each prompt uses
+unique token IDs to guarantee cold miss on first request; hot requests reuse
+the same prompt to guarantee cache hit. Sequential: 5 hot repeats, report
+p50. Concurrent: 1024 tokens/request, 3 rounds, report median.
 
 ![Sequential TTFT](assets/lmcache_e2e_seq_ttft.png)
 
