@@ -37,9 +37,23 @@ allocator, eviction) is unchanged.
 
 ## Performance
 
-vLLM end-to-end on NVIDIA A100-SXM4-40GB + Samsung 990 PRO (PCIe Gen4 x4),
-cross-root-port P2P. Qwen3-0.6B, 256-token LMCache chunks, GDS L1 = 4 GiB,
-vLLM APC disabled, `max_tokens=1` (pure TTFT measurement).
+### Environment
+
+| Component | Version |
+|-----------|---------|
+| GPU | NVIDIA A100-SXM4-40GB |
+| SSD | Samsung 990 PRO (PCIe Gen4 x4, cross-root-port P2P) |
+| Model | Qwen3-0.6B |
+| vLLM | 0.20.1+cu129 |
+| LMCache | 0.5.1.dev35 |
+| PyTorch | 2.11.0+cu129 |
+| CUDA | 12.9 |
+
+LMCache chunk = 256 tokens, GDS L1 = 4 GiB, vLLM APC disabled.
+
+### Cache-hit TTFT and throughput
+
+`max_tokens=1` (pure TTFT measurement).
 
 - **Sequential**: each prompt uses unique token IDs to guarantee a cold miss
   on first request. After the STORE completes, the same prompt is sent 5
@@ -53,6 +67,18 @@ vLLM APC disabled, `max_tokens=1` (pure TTFT measurement).
 ![Concurrent Throughput](assets/lmcache_e2e_conc_throughput.png)
 
 ![Speedup](assets/lmcache_e2e_speedup.png)
+
+### Cold decode throughput
+
+Cold requests where the KV cache STORE (GPU → SSD write) runs concurrently
+with decode. Prompt lengths 512/1024/2048, output lengths 256 and 1024
+tokens, 3 repeats per config, report p50.
+
+![Decode Throughput](assets/lmcache_e2e_decode_throughput.png)
+
+At 2048-token prompt with 256 output tokens, uGDS decode throughput is 24%
+higher than cuFile GDS (394 vs 318 tok/s). The gap narrows with longer
+generation (9% at 1024 output tokens).
 
 ## Usage
 
