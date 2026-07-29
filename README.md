@@ -68,6 +68,22 @@ LMCache chunk = 256 tokens, GDS L1 = 4 GiB, vLLM APC disabled.
 
 ![Speedup](assets/lmcache_e2e_speedup.png)
 
+### SSD-only high-load comparison
+
+The high-load run uses a 40 GiB SSD L1, disables vLLM APC, and requires every
+measured request to report a full external-cache hit. LMCache STORE and RETRIEVE
+token totals are also checked before a point is accepted. Context pressure spans
+3,840 to 40,704 prompt tokens; concurrency spans 1 to 256 requests with 1,024
+tokens per request.
+
+![SSD-only high-load comparison](assets/lmcache_e2e_high_load.png)
+
+At 40,704 tokens, uGDS reduces hot TTFT p50 from 2,367.6 ms to 950.4 ms
+(`2.49×`). At concurrency 256, uGDS reaches 50.2 kTokens/s versus 19.1
+kTokens/s for cuFile GDS (`2.63×`). Raw samples and phase-specific logs are in
+`results/high_load/`; the exact procedure and validity checks are documented in
+`docs/design/v1/gpu_connector/ugds_gds_high_load_experiment.md`.
+
 ### Cold decode throughput
 
 Cold requests where the KV cache STORE (GPU → SSD write) runs concurrently
@@ -146,16 +162,21 @@ python tests/v1/gpu_connector/bench_chunk_read.py gds-context
 
 ### vLLM end-to-end
 
-The E2E benchmark starts an LMCache server and vLLM, runs sequential
-cold/hot and concurrent cache-hit tests, and saves results to JSON.
+The E2E benchmark starts a standalone LMCache server and vLLM with
+``LMCacheMPConnector``. It runs sequential cold/hot and concurrent cache-hit
+tests and saves results to JSON.
 
 ```bash
 # uGDS backend
 export LD_LIBRARY_PATH=/path/to/uGDS/build
-python tests/v1/gpu_connector/bench_e2e.py --backend ugds --device /dev/ugds_drv0
+python tests/v1/gpu_connector/bench_e2e.py \
+    --backend ugds \
+    --device /dev/ugds_drv0
 
 # cuFile GDS backend
-python tests/v1/gpu_connector/bench_e2e.py --backend cufile --slab-dir /mnt/ugds_test
+python tests/v1/gpu_connector/bench_e2e.py \
+    --backend cufile \
+    --slab-dir /mnt/ugds_test
 ```
 
 ## Tests
