@@ -13,6 +13,7 @@ skipped unless that stack is present (see :func:`_gds_available`).
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 import os
 import tempfile
 
@@ -33,6 +34,7 @@ from lmcache.v1.gpu_connector.gds_context import (
     get_gds_context,
     initialize_gds_context,
 )
+from lmcache.v1.memory_management import GDSMemoryObject
 
 
 def _fake_stream(handle: int):
@@ -472,7 +474,7 @@ def test_gds_write_read_roundtrip(gds_slab_dir: Path):
             1,
         )
         assert err == L1Error.SUCCESS
-        mem_obj = objs[0]
+        mem_obj = cast(GDSMemoryObject, objs[0])
 
         buf.fill_(0xAB)
         torch.cuda.synchronize()
@@ -510,7 +512,7 @@ def test_gds_chunk_larger_than_region_roundtrip(gds_slab_dir: Path):
             1,
         )
         assert err == L1Error.SUCCESS
-        mem_obj = objs[0]
+        mem_obj = cast(GDSMemoryObject, objs[0])
 
         # Position-dependent pattern: a mis-offset or swapped segment (e.g. the
         # second segment using the wrong slab offset) would corrupt the bytes

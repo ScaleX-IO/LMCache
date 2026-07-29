@@ -2,11 +2,11 @@
 """Plot uGDS and GDS high-load E2E results on one PNG canvas."""
 
 # Standard
+from pathlib import Path
+from typing import Any
 import argparse
 import json
 import os
-from pathlib import Path
-from typing import Any
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/lmcache-matplotlib")
 
@@ -76,9 +76,7 @@ def validate_pair(
     return ugds, gds
 
 
-def plot_results(
-    ugds: dict[str, Any], gds: dict[str, Any], output: Path
-) -> None:
+def plot_results(ugds: dict[str, Any], gds: dict[str, Any], output: Path) -> None:
     """Create the two-panel TTFT and throughput comparison PNG.
 
     Args:
@@ -148,9 +146,7 @@ def plot_results(
             textcoords="offset points",
             fontsize=9,
         )
-    ttft_axis.set_xticks(
-        context_positions, [f"{value:,}" for value in context_tokens]
-    )
+    ttft_axis.set_xticks(context_positions, [f"{value:,}" for value in context_tokens])
     ttft_axis.set_xlabel("Prompt tokens")
     ttft_axis.set_ylabel("Hot TTFT p50 (ms, lower is better)")
     ttft_axis.set_title("Context pressure: GDS / uGDS ratio")
@@ -214,9 +210,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    ugds, gds = validate_pair(
-        load_result(args.ugds_json), load_result(args.gds_json)
-    )
+    ugds, gds = validate_pair(load_result(args.ugds_json), load_result(args.gds_json))
     plot_results(ugds, gds, args.output)
     print(f"Saved {args.output}")
 

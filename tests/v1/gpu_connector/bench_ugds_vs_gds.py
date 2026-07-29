@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 #!/usr/bin/env python3
 """Benchmark _ugds_async vs _cufile_async through the LMCache GDS interface.
 
@@ -7,26 +8,28 @@ CUDA stream before any synchronization.
 
 Usage:
     # Phase 1: test uGDS (990 PRO bound to ugds_drv)
-    LD_LIBRARY_PATH=/root/uGDS-workspace/uGDS/build python bench_ugds_vs_gds.py --backend ugds
+    LD_LIBRARY_PATH=/root/uGDS-workspace/uGDS/build \
+        python bench_ugds_vs_gds.py --backend ugds
 
     # Then switch driver:
     #   cd /root/uGDS-workspace/uGDS && scripts/env_switch.sh gds 0000:b8:00.0
     #   sudo mount -o data=ordered /dev/nvme0n1 /mnt/ugds_test
 
     # Phase 2: test GDS
-    python bench_ugds_vs_gds.py --backend gds --gds-file /mnt/ugds_test/bench_slab.bin
+    python bench_ugds_vs_gds.py \
+        --backend gds --gds-file /mnt/ugds_test/bench_slab.bin
 
 Results are printed as a table and saved to bench_results_{backend}.json.
 """
 
+# Standard
 import argparse
-import ctypes
 import importlib.util
 import json
 import os
-import sys
 import time
 
+# Third Party
 import torch
 
 SIZES = [4096, 64 * 1024, 128 * 1024, 512 * 1024, 1 * 1024 * 1024]
@@ -51,7 +54,7 @@ def find_ugds_device():
 
 
 def bench_pipeline(handle, buf, size, raw_stream, depth, mode="read"):
-    """Submit `depth` IOs at staggered offsets, sync once. Returns (total_us, bw_MBps)."""
+    """Submit staggered IOs, sync once, and return latency and bandwidth."""
     latencies = []
 
     for i in range(WARMUP + ITERS):
@@ -64,12 +67,18 @@ def bench_pipeline(handle, buf, size, raw_stream, depth, mode="read"):
             offset = d * size
             if mode == "read":
                 handle.read_async(
-                    buf.data_ptr(), size, file_offset=offset, buf_offset=0,
+                    buf.data_ptr(),
+                    size,
+                    file_offset=offset,
+                    buf_offset=0,
                     raw_stream=raw_stream,
                 )
             else:
                 handle.write_async(
-                    buf.data_ptr(), size, file_offset=offset, buf_offset=0,
+                    buf.data_ptr(),
+                    size,
+                    file_offset=offset,
+                    buf_offset=0,
                     raw_stream=raw_stream,
                 )
         torch.cuda.synchronize()
@@ -98,17 +107,30 @@ def run_backend(backend_name, mod, handle, buf_size, raw_stream):
                 if sz * depth > buf_size:
                     continue
                 med, p99, per_io, bw = bench_pipeline(
-                    handle, buf, sz, raw_stream, depth, mode,
+                    handle,
+                    buf,
+                    sz,
+                    raw_stream,
+                    depth,
+                    mode,
                 )
                 label = f"{mode}_{sz}_d{depth}"
                 results[label] = {
-                    "size": sz, "mode": mode, "depth": depth,
-                    "total_us": med, "p99_us": p99,
-                    "per_io_us": per_io, "bw_MBps": bw,
+                    "size": sz,
+                    "mode": mode,
+                    "depth": depth,
+                    "total_us": med,
+                    "p99_us": p99,
+                    "per_io_us": per_io,
+                    "bw_MBps": bw,
                 }
-                sz_str = f"{sz // 1024}K" if sz < 1024 * 1024 else f"{sz // (1024*1024)}M"
-                print(f"  {backend_name:4s} {mode:5s} {sz_str:>5s} x{depth:<3d}: "
-                      f"total={med:10.1f}us  per_io={per_io:8.1f}us  BW={bw:8.1f} MB/s")
+                sz_str = (
+                    f"{sz // 1024}K" if sz < 1024 * 1024 else f"{sz // (1024 * 1024)}M"
+                )
+                print(
+                    f"  {backend_name:4s} {mode:5s} {sz_str:>5s} x{depth:<3d}: "
+                    f"total={med:10.1f}us  per_io={per_io:8.1f}us  BW={bw:8.1f} MB/s"
+                )
 
     mod.deregister_buffer(buf)
     return results
@@ -117,7 +139,13 @@ def run_backend(backend_name, mod, handle, buf_size, raw_stream):
 def run_ugds():
     base = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..", "lmcache", "v1", "gpu_connector", "_ugds_async.py",
+        "..",
+        "..",
+        "..",
+        "lmcache",
+        "v1",
+        "gpu_connector",
+        "_ugds_async.py",
     )
     ua = _load_module("_ugds_async", os.path.normpath(base))
 
@@ -142,7 +170,13 @@ def run_ugds():
 def run_gds(gds_file):
     base = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..", "lmcache", "v1", "gpu_connector", "_cufile_async.py",
+        "..",
+        "..",
+        "..",
+        "lmcache",
+        "v1",
+        "gpu_connector",
+        "_cufile_async.py",
     )
     ca = _load_module("_cufile_async", os.path.normpath(base))
 
@@ -172,8 +206,11 @@ def run_gds(gds_file):
 def main():
     parser = argparse.ArgumentParser(description="uGDS vs GDS pipeline benchmark")
     parser.add_argument("--backend", choices=["ugds", "gds"], required=True)
-    parser.add_argument("--gds-file", default="/mnt/ugds_test/bench_slab.bin",
-                        help="File path for GDS slab (only used with --backend gds)")
+    parser.add_argument(
+        "--gds-file",
+        default="/mnt/ugds_test/bench_slab.bin",
+        help="File path for GDS slab (only used with --backend gds)",
+    )
     args = parser.parse_args()
 
     print(f"=== Pipeline Benchmark: {args.backend.upper()} ===")

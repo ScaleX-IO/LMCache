@@ -13,11 +13,14 @@ fd to register_handle, and wraps the pair via AsyncHandle.from_fd.
 """
 
 # Standard
+from typing import TYPE_CHECKING, Any, Optional
 import ctypes
 import ctypes.util
 import os
-from typing import Any, Optional
 
+if TYPE_CHECKING:
+    # Third Party
+    import torch
 
 # --- libugds.so lazy loading -----------------------------------------
 
@@ -36,6 +39,7 @@ def _get_lib() -> ctypes.CDLL:
 
 
 # --- uGDS C types ----------------------------------------------------
+
 
 class _uGDSError_t(ctypes.Structure):
     _fields_ = [
@@ -69,7 +73,7 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
 
     lib.uGDSHandleRegister.argtypes = [
         ctypes.POINTER(ctypes.c_void_p),  # uGDSHandle_t *fh
-        ctypes.POINTER(_uGDSDescr_t),     # uGDSDescr_t *descr
+        ctypes.POINTER(_uGDSDescr_t),  # uGDSDescr_t *descr
     ]
     lib.uGDSHandleRegister.restype = _uGDSError_t
 
@@ -77,9 +81,9 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
     lib.uGDSHandleDeregister.restype = None
 
     lib.uGDSBufRegister.argtypes = [
-        ctypes.c_void_p,   # const void *bufPtr_base
-        ctypes.c_size_t,   # size_t length
-        ctypes.c_int,      # int flags
+        ctypes.c_void_p,  # const void *bufPtr_base
+        ctypes.c_size_t,  # size_t length
+        ctypes.c_int,  # int flags
     ]
     lib.uGDSBufRegister.restype = _uGDSError_t
 
@@ -87,13 +91,13 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
     lib.uGDSBufDeregister.restype = _uGDSError_t
 
     lib.uGDSReadAsync.argtypes = [
-        ctypes.c_void_p,                   # uGDSHandle_t fh
-        ctypes.c_void_p,                   # void *bufPtr_base
-        ctypes.POINTER(ctypes.c_size_t),   # size_t *size_p
-        ctypes.POINTER(ctypes.c_int64),    # off_t *file_offset_p
-        ctypes.POINTER(ctypes.c_int64),    # off_t *bufPtr_offset_p
-        ctypes.POINTER(ctypes.c_int64),    # ssize_t *bytes_read_p
-        ctypes.c_void_p,                   # cudaStream_t stream
+        ctypes.c_void_p,  # uGDSHandle_t fh
+        ctypes.c_void_p,  # void *bufPtr_base
+        ctypes.POINTER(ctypes.c_size_t),  # size_t *size_p
+        ctypes.POINTER(ctypes.c_int64),  # off_t *file_offset_p
+        ctypes.POINTER(ctypes.c_int64),  # off_t *bufPtr_offset_p
+        ctypes.POINTER(ctypes.c_int64),  # ssize_t *bytes_read_p
+        ctypes.c_void_p,  # cudaStream_t stream
     ]
     lib.uGDSReadAsync.restype = _uGDSError_t
 
@@ -116,6 +120,7 @@ def _declare_signatures(lib: ctypes.CDLL) -> None:
 
 
 # --- Error checking --------------------------------------------------
+
 
 def _check(err: _uGDSError_t, op: str) -> None:
     if err.err != 0:
@@ -151,6 +156,7 @@ def close_driver() -> None:
 
 # --- Handle registration --------------------------------------------
 
+
 def register_handle(fd: int) -> int:
     """Register an open uGDS device fd and return the raw uGDSHandle_t.
 
@@ -181,8 +187,8 @@ def deregister_handle(handle: int) -> None:
 
 # --- Buffer / stream registration -----------------------------------
 
+
 def register_buffer(buf: "torch.Tensor") -> None:
-    import torch
     if not buf.is_cuda:
         raise ValueError("register_buffer: tensor must be on CUDA")
     _ensure_driver_open()
@@ -224,6 +230,7 @@ def deregister_stream(raw_stream: int) -> None:
 
 
 # --- Submission + AsyncHandle ----------------------------------------
+
 
 class Submission:
     """One in-flight uGDSReadAsync / uGDSWriteAsync.

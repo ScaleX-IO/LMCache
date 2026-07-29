@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 #!/usr/bin/env python3
 """Benchmark GDS vs uGDS async read at realistic chunk size (32MB).
 
@@ -5,9 +6,12 @@ Pre-fill uses POSIX writes (avoids cuFileWriteAsync state pollution).
 Tests single-IO and pipeline modes to match LMCache gds_context usage.
 """
 
+# Standard
 import importlib.util
 import os
 import time
+
+# Third Party
 import torch
 
 CHUNK = 32 * 1024 * 1024  # 32MB, Llama3-8B fp16 chunk
@@ -108,6 +112,7 @@ def bench(handle, buffers, depth, raw_stream):
 
 
 def bench_sync(handle, buffers, depth):
+    # Third Party
     from cufile.bindings import libcufile
 
     latencies = []
@@ -142,6 +147,7 @@ def bench_sync(handle, buffers, depth):
 
 
 def bench_context(context, buffers, memory_objects, depth):
+    # First Party
     from lmcache.v1.gpu_connector.gds_context import SlabDirection
 
     latencies = []
@@ -220,6 +226,7 @@ def run_gds(gds_file, synchronous=False):
 
 
 def run_gds_context(backend):
+    # First Party
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.distributed.config import GdsL1Config
     from lmcache.v1.distributed.error import L1Error
@@ -351,6 +358,7 @@ def run_ugds():
 
 
 if __name__ == "__main__":
+    # Standard
     import sys
 
     backend = sys.argv[1] if len(sys.argv) > 1 else "gds"

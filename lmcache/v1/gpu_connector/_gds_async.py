@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 BackendName = Literal["auto", "cufile", "hipfile", "ugds"]
+_backend: ModuleType
+_selected_backend: str
 
 # The backend surface re-exported under stable module-level names so callers
 # (and test monkeypatches) target this module.
@@ -39,17 +41,24 @@ _EXPORTED_NAMES = (
 
 def _load_backend(name: BackendName) -> tuple[str, ModuleType]:
     selected = name
+    backend: ModuleType
     if selected == "auto":
         selected = "hipfile" if torch.version.hip is not None else "cufile"
     if selected == "cufile":
         # First Party
-        from lmcache.v1.gpu_connector import _cufile_async as backend
+        from lmcache.v1.gpu_connector import _cufile_async
+
+        backend = _cufile_async
     elif selected == "hipfile":
         # First Party
-        from lmcache.v1.gpu_connector import _hipfile_async as backend
+        from lmcache.v1.gpu_connector import _hipfile_async
+
+        backend = _hipfile_async
     elif selected == "ugds":
         # First Party
-        from lmcache.v1.gpu_connector import _ugds_async as backend
+        from lmcache.v1.gpu_connector import _ugds_async
+
+        backend = _ugds_async
     else:
         raise ValueError(f"unsupported GDS L1 backend: {name}")
     return selected, backend
@@ -64,16 +73,25 @@ def _bind_backend_surface(backend: ModuleType) -> None:
 if TYPE_CHECKING:
     # Static surface for type checkers; every backend exposes the same names.
     # First Party
-    from lmcache.v1.gpu_connector import _cufile_async as _backend
+    from lmcache.v1.gpu_connector._cufile_async import AsyncHandle as AsyncHandle
+    from lmcache.v1.gpu_connector._cufile_async import Submission as Submission
+    from lmcache.v1.gpu_connector._cufile_async import close_driver as close_driver
     from lmcache.v1.gpu_connector._cufile_async import (
-        AsyncHandle as AsyncHandle,
-        Submission as Submission,
-        close_driver as close_driver,
         deregister_buffer as deregister_buffer,
+    )
+    from lmcache.v1.gpu_connector._cufile_async import (
         deregister_handle as deregister_handle,
+    )
+    from lmcache.v1.gpu_connector._cufile_async import (
         deregister_stream as deregister_stream,
+    )
+    from lmcache.v1.gpu_connector._cufile_async import (
         register_buffer as register_buffer,
+    )
+    from lmcache.v1.gpu_connector._cufile_async import (
         register_handle as register_handle,
+    )
+    from lmcache.v1.gpu_connector._cufile_async import (
         register_stream as register_stream,
     )
 else:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 #!/usr/bin/env python3
 """End-to-end vLLM + LMCache cache-hit benchmark.
 
@@ -13,13 +14,14 @@ Usage:
 """
 
 # Standard
-import argparse
-import concurrent.futures
 from datetime import datetime, timezone
 from importlib import metadata
+from pathlib import Path
+from typing import Any, cast
+import argparse
+import concurrent.futures
 import json
 import os
-from pathlib import Path
 import re
 import signal
 import statistics
@@ -461,7 +463,7 @@ def run_sequential(
     print("\n=== Sequential cold/hot benchmark ===", flush=True)
     if token_counts is None:
         token_counts = SEQ_TOKEN_COUNTS
-    results = []
+    results: list[dict[str, Any]] = []
     for token_count in token_counts:
         seed = seed_base + token_count * 31
         prompt = _unique_prompt(token_count, seed)
@@ -542,7 +544,7 @@ def run_concurrent(
             prompts.append(p)
         time.sleep(STORE_SETTLE_SEC)
 
-        round_results = []
+        round_results: list[dict[str, Any]] = []
         for rnd in range(rounds):
             with concurrent.futures.ThreadPoolExecutor(max_workers=level) as pool:
                 t0 = time.perf_counter()
@@ -563,9 +565,7 @@ def run_concurrent(
                     "wall_ms": wall_ms,
                     "latencies_ms": latencies,
                     "ttfts_ms": ttfts,
-                    "cached_tokens": [
-                        request.cached_tokens for request in req_results
-                    ],
+                    "cached_tokens": [request.cached_tokens for request in req_results],
                     "p95_ms": p95,
                     "ttft_p95_ms": ttft_p95,
                     "throughput_ktok_s": throughput_ktok,
@@ -662,7 +662,7 @@ def _measure_ssd_only_sequential(
     """
     print("\n=== Sequential SSD-only hot benchmark ===", flush=True)
     retrieve_baseline = _log_token_total(lmcache_log, RETRIEVE_PATTERN)
-    results = []
+    results: list[dict[str, Any]] = []
     for token_count, prompt in prompts:
         hot_results = [_request(prompt, model) for _ in range(hot_repeats)]
         validate_external_cache_hits(
@@ -781,12 +781,10 @@ def _measure_ssd_only_concurrent(
     failure = None
     for level in levels:
         retrieve_baseline = _log_token_total(lmcache_log, RETRIEVE_PATTERN)
-        round_results = []
+        round_results: list[dict[str, Any]] = []
         try:
             for round_index in range(rounds):
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=level
-                ) as pool:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=level) as pool:
                     t0 = time.perf_counter()
                     futures = [
                         pool.submit(_request, prompt, model)
@@ -859,9 +857,7 @@ def _measure_ssd_only_concurrent(
 
     return {
         "concurrent": results,
-        "max_successful_concurrency": (
-            results[-1]["concurrency"] if results else None
-        ),
+        "max_successful_concurrency": (results[-1]["concurrency"] if results else None),
         "failure": failure,
     }
 
@@ -925,48 +921,52 @@ def run_ssd_only_phase(
         time.sleep(1)
 
         if phase == "sequential":
-            prompts = [
+            sequential_prompts = [
                 (
                     token_count,
                     _unique_prompt(token_count, 42000 + token_count * 31),
                 )
                 for token_count in seq_token_counts
             ]
-            preload = _run_ssd_only_sequential(
-                prompts, seq_hot_repeats, model, lmcache_log
+            sequential_preload = _run_ssd_only_sequential(
+                sequential_prompts, seq_hot_repeats, model, lmcache_log
             )
-            measured = _measure_ssd_only_sequential(
-                prompts,
-                preload["cold_by_tokens"],
+            sequential_measured = _measure_ssd_only_sequential(
+                sequential_prompts,
+                cast(
+                    dict[int, _RequestResult],
+                    sequential_preload["cold_by_tokens"],
+                ),
                 seq_hot_repeats,
                 model,
                 lmcache_log,
             )
-            measured["evidence"]["store_tokens"] = preload["store_tokens"]
-            measured["evidence"]["expected_store_tokens"] = sum(
-                seq_token_counts
+            sequential_evidence = cast(dict[str, int], sequential_measured["evidence"])
+            sequential_evidence["store_tokens"] = cast(
+                int, sequential_preload["store_tokens"]
             )
-            return measured
+            sequential_evidence["expected_store_tokens"] = sum(seq_token_counts)
+            return sequential_measured
 
         if phase == "concurrent":
             max_concurrency = max(conc_levels)
-            prompts = [
+            concurrent_prompts = [
                 _unique_prompt(conc_token_count, 90000 + index * 7919)
                 for index in range(max_concurrency)
             ]
-            preload = _run_ssd_only_concurrent_preload(
-                prompts, conc_token_count, model, lmcache_log
+            concurrent_preload = _run_ssd_only_concurrent_preload(
+                concurrent_prompts, conc_token_count, model, lmcache_log
             )
-            measured = _measure_ssd_only_concurrent(
-                prompts,
+            concurrent_measured = _measure_ssd_only_concurrent(
+                concurrent_prompts,
                 conc_token_count,
                 conc_levels,
                 conc_rounds,
                 model,
                 lmcache_log,
             )
-            measured["evidence"] = preload
-            return measured
+            concurrent_measured["evidence"] = concurrent_preload
+            return concurrent_measured
 
         raise ValueError(f"unsupported SSD-only phase: {phase}")
     finally:
@@ -1100,11 +1100,7 @@ def main() -> None:
     log_dir = Path(args.log_dir)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    phases = (
-        [args.run_mode]
-        if args.run_mode != "all"
-        else ["sequential", "concurrent"]
-    )
+    phases = [args.run_mode] if args.run_mode != "all" else ["sequential", "concurrent"]
     output: dict[str, object] = {
         "backend": args.backend,
         "model": args.model,

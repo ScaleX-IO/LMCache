@@ -327,7 +327,7 @@ def transfer_kv_per_object_group(
         gather_start = (
             torch_dev.Event(enable_timing=True) if profile_marks is not None else None
         )
-        if gather_start is not None:
+        if gather_start is not None and profile_marks is not None:
             gather_start.record()
 
         # Do paged KV copy
@@ -386,7 +386,7 @@ def transfer_kv_per_object_group(
                 recalculated_skip_blocks,
             )
 
-        if gather_start is not None:
+        if gather_start is not None and profile_marks is not None:
             gather_end = torch_dev.Event(enable_timing=True)
             gather_end.record()
             profile_marks.append(("gather", gather_start, gather_end))
@@ -398,7 +398,7 @@ def transfer_kv_per_object_group(
                 if profile_marks is not None
                 else None
             )
-            if io_start is not None:
+            if io_start is not None and profile_marks is not None:
                 io_start.record()
             for chunk_idx, memory_obj in enumerate(memory_object_batch):
                 lmcache_memcpy_async_d2h(
@@ -407,7 +407,7 @@ def transfer_kv_per_object_group(
                     ),
                     memory_obj,
                 )
-            if io_start is not None:
+            if io_start is not None and profile_marks is not None:
                 io_end = torch_dev.Event(enable_timing=True)
                 io_end.record()
                 profile_marks.append(("io", io_start, io_end))
@@ -854,10 +854,10 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             producer_wait_start = (
                 torch_dev.Event(enable_timing=True) if profile_enabled else None
             )
-            if producer_wait_start is not None:
+            if producer_wait_start is not None and profile_marks is not None:
                 producer_wait_start.record()
             vllm_event.wait(stream=cache_context.stream)
-            if producer_wait_start is not None:
+            if producer_wait_start is not None and profile_marks is not None:
                 producer_wait_end = torch_dev.Event(enable_timing=True)
                 producer_wait_end.record()
                 profile_marks.append(

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 #!/usr/bin/env python3
 """Benchmark GDS vs uGDS async write at realistic chunk size (32MB).
 
@@ -5,15 +6,16 @@ Measures write throughput through the full GDSContext path and raw backend,
 complementing bench_chunk_read.py.
 """
 
+# Standard
 import importlib.util
 import os
 import time
+
+# Third Party
 import torch
 
 CHUNK = 32 * 1024 * 1024  # 32MB
-DEPTHS = [
-    int(d) for d in os.environ.get("LMCACHE_BENCH_DEPTHS", "1,4,16").split(",")
-]
+DEPTHS = [int(d) for d in os.environ.get("LMCACHE_BENCH_DEPTHS", "1,4,16").split(",")]
 WARMUP = int(os.environ.get("LMCACHE_BENCH_WARMUP", "3"))
 ITERS = int(os.environ.get("LMCACHE_BENCH_ITERS", "20"))
 
@@ -104,6 +106,7 @@ def verify_readback(handle, buffers, depth, raw_stream):
 
 
 def bench_context_write(context, buffers, memory_objects, depth):
+    # First Party
     from lmcache.v1.gpu_connector.gds_context import SlabDirection
 
     latencies = []
@@ -135,7 +138,13 @@ def bench_context_write(context, buffers, memory_objects, depth):
 def run_ugds():
     base = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..", "lmcache", "v1", "gpu_connector", "_ugds_async.py",
+        "..",
+        "..",
+        "..",
+        "lmcache",
+        "v1",
+        "gpu_connector",
+        "_ugds_async.py",
     )
     ua = _load_module("_ugds_async", os.path.normpath(base))
 
@@ -146,8 +155,7 @@ def run_ugds():
     ugds_handle = ua.register_handle(fd)
     handle = ua.AsyncHandle.from_fd(fd, ugds_handle, device_path, writable=True)
     buffers = [
-        torch.empty(CHUNK, dtype=torch.uint8, device="cuda")
-        for _ in range(max(DEPTHS))
+        torch.empty(CHUNK, dtype=torch.uint8, device="cuda") for _ in range(max(DEPTHS))
     ]
     for buf in buffers:
         ua.register_buffer(buf)
@@ -174,7 +182,13 @@ def run_ugds():
 def run_gds(gds_file):
     base = os.path.join(
         os.path.dirname(__file__),
-        "..", "..", "..", "lmcache", "v1", "gpu_connector", "_cufile_async.py",
+        "..",
+        "..",
+        "..",
+        "lmcache",
+        "v1",
+        "gpu_connector",
+        "_cufile_async.py",
     )
     ca = _load_module("_cufile_async", os.path.normpath(base))
 
@@ -188,8 +202,7 @@ def run_gds(gds_file):
     handle = ca.AsyncHandle.from_fd(fd, cufile_handle, gds_file, writable=True)
 
     buffers = [
-        torch.empty(CHUNK, dtype=torch.uint8, device="cuda")
-        for _ in range(max(DEPTHS))
+        torch.empty(CHUNK, dtype=torch.uint8, device="cuda") for _ in range(max(DEPTHS))
     ]
     for buf in buffers:
         ca.register_buffer(buf)
@@ -214,6 +227,7 @@ def run_gds(gds_file):
 
 
 def run_context(backend):
+    # First Party
     from lmcache.v1.distributed.api import MemoryLayoutDesc
     from lmcache.v1.distributed.config import GdsL1Config
     from lmcache.v1.distributed.error import L1Error
@@ -229,8 +243,7 @@ def run_context(backend):
     context = GDSContext()
     context.initialize(config)
     buffers = [
-        torch.empty(CHUNK, dtype=torch.uint8, device="cuda")
-        for _ in range(max(DEPTHS))
+        torch.empty(CHUNK, dtype=torch.uint8, device="cuda") for _ in range(max(DEPTHS))
     ]
     for buf in buffers:
         context.register_gpu_buffer(buf)
@@ -261,6 +274,7 @@ def run_context(backend):
 
 
 if __name__ == "__main__":
+    # Standard
     import sys
 
     backend = sys.argv[1] if len(sys.argv) > 1 else "ugds"

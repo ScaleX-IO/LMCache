@@ -5,14 +5,14 @@ Verifies that _ugds_async exports the same API surface as _cufile_async
 and that the uGDS DMA path works end-to-end on hardware with ugds_drv loaded.
 
 Run standalone:
-    PYTHONPATH=. python -m pytest tests/v1/gpu_connector/test_ugds_async.py --noconftest -v
+    PYTHONPATH=. python -m pytest \
+        tests/v1/gpu_connector/test_ugds_async.py --noconftest -v
 """
 
 # Standard
 import ctypes
 import importlib.util
 import os
-import sys
 
 # Third Party
 import pytest
@@ -21,7 +21,13 @@ import torch
 # Direct import of the module under test, avoiding lmcache's heavy import chain.
 _MODULE_PATH = os.path.join(
     os.path.dirname(__file__),
-    "..", "..", "..", "lmcache", "v1", "gpu_connector", "_ugds_async.py",
+    "..",
+    "..",
+    "..",
+    "lmcache",
+    "v1",
+    "gpu_connector",
+    "_ugds_async.py",
 )
 _MODULE_PATH = os.path.normpath(_MODULE_PATH)
 
@@ -117,8 +123,11 @@ class TestUgdsRoundtrip:
             # Write pattern
             buf.fill_(0xAB)
             torch.cuda.synchronize()
-            sub_w = handle.write_async(
-                buf.data_ptr(), size, file_offset=0, buf_offset=0,
+            handle.write_async(
+                buf.data_ptr(),
+                size,
+                file_offset=0,
+                buf_offset=0,
                 raw_stream=raw_stream,
             )
             torch.cuda.synchronize()
@@ -127,7 +136,10 @@ class TestUgdsRoundtrip:
             buf.zero_()
             torch.cuda.synchronize()
             sub_r = handle.read_async(
-                buf.data_ptr(), size, file_offset=0, buf_offset=0,
+                buf.data_ptr(),
+                size,
+                file_offset=0,
+                buf_offset=0,
                 raw_stream=raw_stream,
             )
             torch.cuda.synchronize()

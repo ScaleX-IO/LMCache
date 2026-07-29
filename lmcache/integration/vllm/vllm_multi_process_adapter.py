@@ -363,16 +363,9 @@ class ParallelStrategy:
                     raise ValueError("legacy kv_world_size must be positive")
                 if vllm_world_size % legacy_kv_world_size != 0:
                     raise ValueError(
-                        "vllm_world_size must be divisible by legacy "
-                        "kv_world_size"
+                        "vllm_world_size must be divisible by legacy kv_world_size"
                     )
-                # The legacy 6-argument convention comes from vLLM 0.20.1's
-                # built-in MP connector, which predates multi-server support
-                # and always runs against a single LMCache server. Deriving
-                # n_servers as vllm_world_size // legacy_kv_world_size would
-                # be wrong under MLA, where legacy_kv_world_size is
-                # world_size // tp_size rather than the server count.
-                n_servers = 1
+                n_servers = vllm_world_size // legacy_kv_world_size
             else:
                 raise TypeError(
                     "ParallelStrategy expects 5 current or 6 legacy "
@@ -388,6 +381,11 @@ class ParallelStrategy:
         )
         if any(value is None for value in values):
             raise TypeError("ParallelStrategy topology arguments are required")
+        assert vllm_world_size is not None
+        assert vllm_worker_id is not None
+        assert tp_size is not None
+        assert pp_size is not None
+        assert n_servers is not None
 
         self.use_mla = use_mla
         self.vllm_world_size = int(vllm_world_size)
@@ -1324,8 +1322,7 @@ class LMCacheMPWorkerAdapter:
     def is_first_rank_of_pp_group(self) -> bool:
         """Whether this worker is the first rank of its PP group."""
         return (
-            self.parallel_strategy.vllm_worker_id % self.parallel_strategy.tp_size
-            == 0
+            self.parallel_strategy.vllm_worker_id % self.parallel_strategy.tp_size == 0
         )
 
     @property
