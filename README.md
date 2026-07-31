@@ -5,9 +5,9 @@ to the GDS L1 tier of [LMCache](https://github.com/LMCache/LMCache).
 
 uGDS is a user-space GPUDirect Storage library: the NVMe IO path runs
 entirely in user space (no kernel driver, no ioctl per IO), and the SSD
-DMAs data directly to/from GPU memory. Compared to NVIDIA cuFile GDS,
-uGDS delivers up to **2x lower TTFT** on cache-hit requests and **2x
-higher throughput** under concurrent load in vLLM end-to-end benchmarks.
+DMAs data directly to/from GPU memory. In the SSD-only high-load benchmark,
+uGDS delivers up to **2.68× TTFT speedup** on cache-hit requests and **2.63×
+the logical KV retrieval throughput** of NVIDIA cuFile GDS.
 
 ---
 
@@ -80,9 +80,30 @@ tokens per request.
 
 At 40,704 tokens, uGDS reduces hot TTFT p50 from 2,367.6 ms to 950.4 ms
 (`2.49×`). At concurrency 256, uGDS reaches 50.2 kTokens/s versus 19.1
-kTokens/s for cuFile GDS (`2.63×`). Raw samples and phase-specific logs are in
-`results/high_load/`; the exact procedure and validity checks are documented in
-`docs/design/v1/gpu_connector/ugds_gds_high_load_experiment.md`.
+kTokens/s for cuFile GDS (`2.63×`). Throughput counts retrieved prompt/KV
+tokens, not generated output tokens. See the
+[high-load analysis](docs/design/v1/gpu_connector/ugds_gds_high_load_analysis.md)
+for the workload contract, validity checks, raw-data locations, and scope.
+
+### Performance breakdown
+
+The matched breakdown follows the difference from raw 16 MiB async reads,
+through the production-shaped LMCache transaction, to the request-level
+SSD-to-temp stage. It then changes the API and stream count to test whether the
+difference is a general storage-bandwidth limit or specific to LMCache's I/O
+shape.
+
+![uGDS and cuFile GDS performance breakdown](assets/lmcache_ugds_gds_breakdown.png)
+
+The async advantage is preserved across the raw, transaction, and request
+layers (`2.42×–2.80×`). At depth 64, cuFile submission occupies 99.6% of the
+transaction wall time, versus 1.0% for uGDS. The 16 MiB synchronous control is
+statistically consistent with parity (`0.96×`, 90% CI `[0.939, 1.005]`), while
+the matched single-stream async case separates by `2.33×`; 16 cuFile streams
+recover much of the difference. The
+[breakdown report](docs/design/v1/gpu_connector/ugds_gds_breakdown_findings.md)
+defines the metrics, statistical treatment, causal interpretation, and
+limitations.
 
 ### Cold decode throughput
 
