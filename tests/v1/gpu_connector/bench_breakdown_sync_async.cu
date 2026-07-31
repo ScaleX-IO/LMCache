@@ -1,0 +1,513 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <limits>
+#include <vector>
+
+#ifdef __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime.h>
+#define cudaMalloc hipMalloc
+#define cudaFree hipFree
+#define cudaMemcpy hipMemcpy
+#define cudaMemset hipMemset
+#define cudaSetDevice hipSetDevice
+#define cudaDeviceSynchronize hipDeviceSynchronize
+#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaSuccess hipSuccess
+#define cudaError_t hipError_t
+#define cudaGetErrorString hipGetErrorString
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaStreamCreate hipStreamCreate
+#define cudaStreamDestroy hipStreamDestroy
+#define cudaStream_t hipStream_t
+/* HIP builds must use dmabuf path */
+#define TEST_BUF_FLAGS UGDS_REGISTER_DMABUF
+#else
+#include <cuda_runtime.h>
+#define TEST_BUF_FLAGS 0
+#endif
+
+#ifdef USE_NVIDIA_GDS
+#include <cufile.h>
+#define uGDSError_t CUfileError_t
+#define uGDSHandle_t CUfileHandle_t
+#define uGDSDescr_t CUfileDescr_t
+#define uGDSOpError CUfileOpError
+#define uGDSDriverOpen cuFileDriverOpen
+#define uGDSDriverClose cuFileDriverClose
+#define uGDSHandleRegister cuFileHandleRegister
+#define uGDSHandleDeregister cuFileHandleDeregister
+#define uGDSBufRegister cuFileBufRegister
+#define uGDSBufDeregister cuFileBufDeregister
+#define uGDSRead cuFileRead
+#define uGDSWrite cuFileWrite
+#define UGDS_SUCCESS CU_FILE_SUCCESS
+#define UGDS_HANDLE_TYPE_OPAQUE_FD CU_FILE_HANDLE_TYPE_OPAQUE_FD
+#define uGDS_status_error cufileop_status_error
+#define uGDSBatchHandle_t CUfileBatchHandle_t
+#define uGDSIOEvents_t CUfileIOEvents_t
+#define uGDSBatchIOGetStatus cuFileBatchIOGetStatus
+#define uGDSBatchIODestroy cuFileBatchIODestroy
+#define UGDS_BATCH_COMPLETE CU_FILE_BATCH_IO_COMPLETE
+#define uGDSReadAsync cuFileReadAsync
+#define uGDSWriteAsync cuFileWriteAsync
+// Match LMCache's cuFile async wrapper: buffer offset, file offset, and size
+// pointers are stable until the immediately following stream synchronize.
+static inline uGDSError_t uGDSStreamRegister(cudaStream_t s) {
+  return cuFileStreamRegister(s, 0x7);
+}
+#define uGDSStreamDeregister cuFileStreamDeregister
+#else
+#include <ugds.h>
+#endif
+
+#include "bench_breakdown_utils.h"
+
+#define CHECK_CUDA(call)                                               \
+  do {                                                                 \
+    cudaError_t err = (call);                                          \
+    if (err != cudaSuccess) {                                          \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+              cudaGetErrorString(err));                                \
+      exit(EXIT_FAILURE);                                              \
+    }                                                                  \
+  } while (0)
+
+#define CHECK_UGDS(call, msg)                                                 \
+  do {                                                                        \
+    uGDSError_t status = (call);                                              \
+    if (status.err != UGDS_SUCCESS) {                                         \
+      fprintf(stderr, "%s failed: %s\n", msg, uGDS_status_error(status.err)); \
+      exit(EXIT_FAILURE);                                                     \
+    }                                                                         \
+  } while (0)
+
+static void* sync_rw_thread(void* arg) {
+  ThreadData* data = (ThreadData*)arg;
+  struct timespec io_start, io_end;
+  uGDSHandle_t cf_handle = *(uGDSHandle_t*)data->handler;
+  size_t done_bytes = 0;
+
+  struct timespec cpu_start, cpu_end;
+  clock_gettime(CLOCK_MONOTONIC, &data->start_time);
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_start);
+
+  while (done_bytes < data->size) {
+    size_t remaining = data->size - done_bytes;
+    size_t this_io = (remaining < data->io_size) ? remaining : data->io_size;
+
+    clock_gettime(CLOCK_MONOTONIC, &io_start);
+
+    ssize_t result;
+    if (data->mode == 1) {
+      result = uGDSWrite(cf_handle, data->gpu_buffer, this_io,
+                         data->offset + done_bytes, 0);
+    } else {
+      result = uGDSRead(cf_handle, data->gpu_buffer, this_io,
+                        data->offset + done_bytes, 0);
+    }
+
+    if (result == 0) {
+      break;
+    }
+    if (result != (ssize_t)this_io) {
+      fprintf(stderr, "thread %d: IO error, result=%zd, expected=%zu\n",
+              data->thread_id, result, this_io);
+      return NULL;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &io_end);
+
+    uint64_t io_time = ts_diff_ns(io_start, io_end);
+    data->latency_vec.push_back(io_time);
+    data->total_io_time += io_time;
+    data->io_operations++;
+    data->total_bytes += result;
+    done_bytes += result;
+  }
+
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_end);
+  clock_gettime(CLOCK_MONOTONIC, &data->end_time);
+  data->cpu_time_ns = ts_diff_ns(cpu_start, cpu_end);
+  data->wall_time_ns = ts_diff_ns(data->start_time, data->end_time);
+  return NULL;
+}
+
+static void* batch_rw_thread(void* arg) {
+  ThreadData* data = (ThreadData*)arg;
+  struct timespec batch_start, batch_end;
+  uGDSHandle_t cf_handle = *(uGDSHandle_t*)data->handler;
+  size_t batch_size = data->depth;
+  size_t done_bytes = 0;
+
+  uGDSBatchHandle_t batch = nullptr;
+#ifdef USE_NVIDIA_GDS
+  uGDSError_t bst =
+      cuFileBatchIOSetUp(&batch, static_cast<unsigned>(batch_size));
+#else
+  uGDSError_t bst =
+      uGDSBatchIOSetUp(&batch, cf_handle, static_cast<unsigned>(batch_size));
+#endif
+  if (bst.err != UGDS_SUCCESS) {
+    fprintf(stderr, "thread %d: BatchIOSetUp failed\n", data->thread_id);
+    return nullptr;
+  }
+
+#ifdef USE_NVIDIA_GDS
+  std::vector<CUfileIOParams_t> params(batch_size);
+#else
+  std::vector<uGDSIOParams_t> params(batch_size);
+#endif
+  std::vector<uGDSIOEvents_t> events(batch_size);
+
+  clock_gettime(CLOCK_MONOTONIC, &data->start_time);
+
+  while (done_bytes < data->size) {
+    unsigned nr = 0;
+    size_t batch_bytes = 0;
+    for (size_t i = 0; i < batch_size && done_bytes + batch_bytes < data->size;
+         i++) {
+      size_t remaining = data->size - done_bytes - batch_bytes;
+      size_t this_io = (remaining < data->io_size) ? remaining : data->io_size;
+
+      memset(&params[i], 0, sizeof(params[0]));
+#ifdef USE_NVIDIA_GDS
+      params[i].mode = CUFILE_BATCH;
+      params[i].u.batch.devPtr_base = data->gpu_buffer;
+      params[i].u.batch.file_offset = data->offset + done_bytes + batch_bytes;
+      params[i].u.batch.devPtr_offset = (done_bytes + batch_bytes) % data->size;
+      params[i].u.batch.size = this_io;
+      params[i].fh = cf_handle;
+      params[i].opcode = data->mode ? CUFILE_WRITE : CUFILE_READ;
+#else
+      params[i].devPtr_base = data->gpu_buffer;
+      params[i].file_offset = data->offset + done_bytes + batch_bytes;
+      params[i].devPtr_offset = (done_bytes + batch_bytes) % data->size;
+      params[i].size = this_io;
+      params[i].opcode = data->mode ? UGDS_WRITE : UGDS_READ;
+#endif
+      nr++;
+      batch_bytes += this_io;
+    }
+    if (nr == 0) break;
+
+    clock_gettime(CLOCK_MONOTONIC, &batch_start);
+
+#ifdef USE_NVIDIA_GDS
+    uGDSError_t st = cuFileBatchIOSubmit(batch, nr, params.data(), 0);
+#else
+    uGDSError_t st = uGDSBatchIOSubmit(batch, nr, params.data(), 0);
+#endif
+    if (st.err != UGDS_SUCCESS) {
+      fprintf(stderr, "thread %d: BatchIOSubmit failed\n", data->thread_id);
+      break;
+    }
+
+    unsigned nr_out = nr;
+    st = uGDSBatchIOGetStatus(batch, nr, &nr_out, events.data(), nullptr);
+    if (st.err != UGDS_SUCCESS) {
+      fprintf(stderr, "thread %d: BatchIOGetStatus failed\n", data->thread_id);
+      break;
+    }
+    if (nr_out != nr) {
+      fprintf(stderr,
+              "thread %d: batch incomplete: submitted %u, completed %u\n",
+              data->thread_id, nr, nr_out);
+    }
+    size_t completed_bytes = 0;
+    for (unsigned i = 0; i < nr_out; i++) {
+      if ((ssize_t)events[i].ret < 0) {
+        fprintf(stderr, "thread %d: batch event[%u] error: ret=%zd\n",
+                data->thread_id, i, (ssize_t)events[i].ret);
+      } else {
+        completed_bytes += events[i].ret;
+      }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &batch_end);
+
+    uint64_t batch_time = ts_diff_ns(batch_start, batch_end);
+    data->latency_vec.push_back(batch_time);
+    data->total_io_time += batch_time;
+    data->io_operations += nr_out;
+    data->total_bytes += completed_bytes;
+    done_bytes += batch_bytes;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &data->end_time);
+  uGDSBatchIODestroy(batch);
+  return nullptr;
+}
+
+static void* async_rw_thread(void* arg) {
+  ThreadData* data = (ThreadData*)arg;
+  struct timespec io_start, io_end;
+  uGDSHandle_t cf_handle = *(uGDSHandle_t*)data->handler;
+  size_t done_bytes = 0;
+
+  cudaStream_t stream;
+  CHECK_CUDA(cudaSetDevice(data->device_id));
+  CHECK_CUDA(cudaStreamCreate(&stream));
+
+  uGDSError_t reg_st = uGDSStreamRegister(stream);
+  if (reg_st.err != UGDS_SUCCESS) {
+    fprintf(stderr, "thread %d: StreamRegister failed\n", data->thread_id);
+  }
+
+  size_t size;
+  off_t file_off;
+  off_t buf_off;
+  ssize_t result;
+
+  clock_gettime(CLOCK_MONOTONIC, &data->start_time);
+
+  while (done_bytes < data->size) {
+    size_t remaining = data->size - done_bytes;
+    size_t this_io = (remaining < data->io_size) ? remaining : data->io_size;
+
+    size = this_io;
+    file_off = data->offset + done_bytes;
+    // Reuse exactly one I/O-sized registered region in both sync and
+    // async modes. This removes GPU-buffer traversal as a matrix variable.
+    buf_off = 0;
+    result = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &io_start);
+
+    uGDSError_t st;
+    if (data->mode == 1) {
+      st = uGDSWriteAsync(cf_handle, data->gpu_buffer, &size, &file_off,
+                          &buf_off, &result, stream);
+    } else {
+      st = uGDSReadAsync(cf_handle, data->gpu_buffer, &size, &file_off,
+                         &buf_off, &result, stream);
+    }
+    if (st.err != UGDS_SUCCESS) {
+      fprintf(stderr, "thread %d: async IO enqueue failed\n", data->thread_id);
+      break;
+    }
+
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+
+    if (result != (ssize_t)this_io) {
+      fprintf(stderr, "thread %d: async IO error, result=%zd, expected=%zu\n",
+              data->thread_id, result, this_io);
+      break;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &io_end);
+
+    uint64_t io_time = ts_diff_ns(io_start, io_end);
+    data->latency_vec.push_back(io_time);
+    data->total_io_time += io_time;
+    data->io_operations++;
+    data->total_bytes += result;
+    done_bytes += result;
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &data->end_time);
+  uGDSStreamDeregister(stream);
+  cudaStreamDestroy(stream);
+  return NULL;
+}
+
+static size_t get_bench_base_offset() {
+  const char* value = getenv("UGDS_BENCH_BASE_OFFSET");
+  if (value == nullptr) return 0;
+
+  errno = 0;
+  char* end = nullptr;
+  unsigned long long parsed = strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' ||
+      parsed > std::numeric_limits<size_t>::max() || (parsed % 4096) != 0) {
+    fprintf(stderr,
+            "invalid UGDS_BENCH_BASE_OFFSET (must be 4K-aligned bytes): %s\n",
+            value);
+    exit(EXIT_FAILURE);
+  }
+  return static_cast<size_t>(parsed);
+}
+
+static void run_ugds_bench(BenchOpts& opts) {
+  struct timespec prog_start, prog_end;
+  uGDSError_t status;
+  uGDSDescr_t cf_descr;
+  uGDSHandle_t cf_handle;
+  int file_fd;
+  const size_t base_offset = get_bench_base_offset();
+
+  if (base_offset > static_cast<size_t>(std::numeric_limits<off_t>::max()) ||
+      opts.length > static_cast<size_t>(std::numeric_limits<off_t>::max()) -
+                        base_offset) {
+    fprintf(stderr, "benchmark offset range exceeds off_t\n");
+    exit(EXIT_FAILURE);
+  }
+
+  const char* label;
+#ifdef USE_NVIDIA_GDS
+  if (opts.is_async)
+    label = opts.is_write ? "GDS-async-write" : "GDS-async-read";
+  else if (opts.is_batch)
+    label = opts.is_write ? "GDS-batch-write" : "GDS-batch-read";
+  else
+    label = opts.is_write ? "GDS-write" : "GDS-read";
+#else
+  if (opts.is_async)
+    label = opts.is_write ? "uGDS-async-write" : "uGDS-async-read";
+  else if (opts.is_batch)
+    label = opts.is_write ? "uGDS-batch-write" : "uGDS-batch-read";
+  else
+    label = opts.is_write ? "uGDS-write" : "uGDS-read";
+#endif
+
+#ifdef USE_NVIDIA_GDS
+  printf("=== GDS Benchmark ===\n");
+#else
+  printf("=== uGDS Benchmark ===\n");
+#endif
+  printf("  File:       %s\n", opts.file_path);
+  printf("  Base offset:%zu bytes\n", base_offset);
+  printf("  Length:     %zu bytes (%.2f MB)\n", opts.length,
+         opts.length / (double)MB);
+  printf("  IO size:    %zu bytes\n", opts.io_size);
+  printf("  Threads:    %d\n", opts.num_threads);
+  printf("  IO depth:   %d\n", opts.io_depth);
+  printf("  GPU:        %d\n", opts.gpu_id);
+  printf("  Mode:       %s%s\n",
+         opts.is_async ? "async-" : (opts.is_batch ? "batch-" : ""),
+         opts.is_write ? "write" : "read");
+#ifndef USE_NVIDIA_GDS
+  {
+    const char* env = getenv("UGDS_INTERRUPT_MODE");
+    bool irq = env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 ||
+                       strcmp(env, "true") == 0 || strcmp(env, "yes") == 0);
+    printf("  Completion: %s\n", irq ? "interrupt (MSI-X)" : "busy-poll");
+    printf("  Requested sync QPs: %s\n",
+           getenv("UGDS_SYNC_QPS") ? getenv("UGDS_SYNC_QPS") : "15 (default)");
+    printf("  Requested IRQ channels: %s\n",
+           getenv("UGDS_IRQ_CHANNELS") ? getenv("UGDS_IRQ_CHANNELS") : "auto");
+    printf("  Requested IRQ sharing: %s\n", getenv("UGDS_IRQ_SHARING")
+                                                ? getenv("UGDS_IRQ_SHARING")
+                                                : "exclusive");
+  }
+#endif
+  printf("\n");
+
+  CHECK_CUDA(cudaSetDevice(opts.gpu_id));
+
+  status = uGDSDriverOpen();
+  if (status.err != UGDS_SUCCESS) {
+    fprintf(stderr, "uGDSDriverOpen failed: %s\n",
+            uGDS_status_error(status.err));
+    exit(EXIT_FAILURE);
+  }
+
+  int open_flags = O_RDWR;
+#ifdef USE_O_DIRECT
+  open_flags |= O_DIRECT;
+#endif
+  file_fd = open(opts.file_path, open_flags, 0644);
+  if (file_fd < 0) {
+    perror("open file failed");
+    uGDSDriverClose();
+    exit(EXIT_FAILURE);
+  }
+
+  memset(&cf_descr, 0, sizeof(uGDSDescr_t));
+  cf_descr.handle.fd = file_fd;
+  cf_descr.type = UGDS_HANDLE_TYPE_OPAQUE_FD;
+  CHECK_UGDS(uGDSHandleRegister(&cf_handle, &cf_descr), "uGDSHandleRegister");
+
+  size_t chunk_size = opts.length / opts.num_threads;
+  int num_threads = opts.num_threads;
+
+  std::vector<ThreadData> threads(num_threads);
+  std::vector<pthread_t> pthreads(num_threads);
+
+  for (int i = 0; i < num_threads; i++) {
+    ThreadData* td = &threads[i];
+    td->thread_id = i;
+    td->fd = file_fd;
+    td->mode = opts.is_write ? 1 : 0;
+    td->offset = static_cast<off_t>(base_offset + i * chunk_size);
+    td->size = chunk_size;
+    td->io_size = opts.io_size;
+    td->depth = opts.io_depth;
+    td->handler = &cf_handle;
+    td->total_io_time = 0;
+    td->io_operations = 0;
+    td->total_bytes = 0;
+    td->cpu_time_ns = 0;
+    td->wall_time_ns = 0;
+    td->device_id = opts.gpu_id;
+
+    CHECK_CUDA(cudaMalloc(&td->gpu_buffer, opts.io_size));
+    CHECK_CUDA(cudaMemset(td->gpu_buffer, 0x00, opts.io_size));
+    CHECK_CUDA(cudaStreamSynchronize(0));
+
+    CHECK_UGDS(uGDSBufRegister(td->gpu_buffer, opts.io_size, TEST_BUF_FLAGS),
+               "uGDSBufRegister");
+
+    td->latency_vec.reserve(chunk_size / opts.io_size + 10);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &prog_start);
+
+  for (int i = 0; i < num_threads; i++) {
+    void* (*thread_fn)(void*) = sync_rw_thread;
+    if (opts.is_async)
+      thread_fn = async_rw_thread;
+    else if (opts.is_batch)
+      thread_fn = batch_rw_thread;
+    if (pthread_create(&pthreads[i], NULL, thread_fn, &threads[i]) != 0) {
+      perror("pthread_create failed");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  for (int i = 0; i < num_threads; i++) {
+    pthread_join(pthreads[i], NULL);
+  }
+
+  clock_gettime(CLOCK_MONOTONIC, &prog_end);
+
+  uint64_t prog_time_ns = ts_diff_ns(prog_start, prog_end);
+
+  size_t actual_bytes = 0;
+  for (auto& t : threads) actual_bytes += t.total_bytes;
+
+  bool show_cpu = !opts.is_batch && !opts.is_async;
+  report_results(label, threads, opts.io_size, actual_bytes, prog_time_ns,
+                 opts.json, show_cpu);
+
+  fprintf(stderr, "PHASE_D_CLEANUP begin buffer cleanup\n");
+  for (int i = 0; i < num_threads; i++) {
+    uGDSBufDeregister(threads[i].gpu_buffer);
+    cudaFree(threads[i].gpu_buffer);
+  }
+  fprintf(stderr, "PHASE_D_CLEANUP end buffer cleanup\n");
+
+  uGDSHandleDeregister(cf_handle);
+  fprintf(stderr, "PHASE_D_CLEANUP end handle deregister\n");
+  close(file_fd);
+  fprintf(stderr, "PHASE_D_CLEANUP begin driver close\n");
+  uGDSDriverClose();
+  fprintf(stderr, "PHASE_D_CLEANUP end driver close\n");
+}
+
+int main(int argc, char** argv) {
+  BenchOpts opts;
+  if (!parse_bench_opts(argc, argv, opts)) {
+    return EXIT_FAILURE;
+  }
+  run_ugds_bench(opts);
+  return 0;
+}

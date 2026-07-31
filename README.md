@@ -200,6 +200,125 @@ python tests/v1/gpu_connector/bench_e2e.py \
     --slab-dir /mnt/ugds_test
 ```
 
+For the SSD-only high-load experiment described above, run the same matrix for
+each backend. The output paths are explicit so the comparison can be reproduced
+without relying on a user-specific directory:
+
+```bash
+# Run once with the SSD bound to uGDS.
+python tests/v1/gpu_connector/bench_e2e.py \
+    --backend ugds --device /dev/ugds_drv0 \
+    --model /path/to/Qwen3-0.6B --ssd-only \
+    --l1-size-gb 40 --max-model-len 40960 --max-num-seqs 256 \
+    --seq-token-counts 3840,8192,16384,32768,40704 \
+    --seq-hot-repeats 5 --conc-token-count 1024 \
+    --conc-levels 1,2,4,8,16,32,64,128,256 --conc-rounds 3 \
+    --output results/high_load/ugds.json
+
+# Rebind and mount the SSD for cuFile, then run the matched workload.
+python tests/v1/gpu_connector/bench_e2e.py \
+    --backend cufile --slab-dir /mnt/ugds_test \
+    --model /path/to/Qwen3-0.6B --ssd-only \
+    --l1-size-gb 40 --max-model-len 40960 --max-num-seqs 256 \
+    --seq-token-counts 3840,8192,16384,32768,40704 \
+    --seq-hot-repeats 5 --conc-token-count 1024 \
+    --conc-levels 1,2,4,8,16,32,64,128,256 --conc-rounds 3 \
+    --output results/high_load/gds.json
+
+python tests/v1/gpu_connector/plot_e2e_high_load.py \
+    results/high_load/ugds.json results/high_load/gds.json \
+    --output assets/lmcache_e2e_high_load.png
+```
+
+### Performance breakdown
+
+The breakdown uses the same 40 GiB workset and five measured rounds reported in
+the analysis. Select one backend after binding the SSD appropriately. For uGDS,
+set both paths to the raw device:
+
+```bash
+export BACKEND=ugds
+export RAW_PATH=/dev/ugds_drv0
+export CONTEXT_PATH=/dev/ugds_drv0
+export OUTPUT_ROOT=results/breakdown/runs/ugds
+```
+
+For cuFile, use a file for the raw benchmark and the containing directory for
+the production `GDSContext` benchmark:
+
+```bash
+export BACKEND=cufile
+export RAW_PATH=/mnt/ugds_test/breakdown_raw.bin
+export CONTEXT_PATH=/mnt/ugds_test
+export OUTPUT_ROOT=results/breakdown/runs/cufile
+```
+
+Then run the matched raw and production-transaction campaigns. The first raw
+round initializes and validates the 40 GiB workset; later rounds reuse it.
+
+```bash
+python -m tests.v1.gpu_connector.bench_breakdown_raw_async \
+    --backend "$BACKEND" --path "$RAW_PATH" --round 1 --initialize \
+    --output-dir "$OUTPUT_ROOT/raw_async"
+
+for round in 2 3 4 5; do
+    python -m tests.v1.gpu_connector.bench_breakdown_raw_async \
+        --backend "$BACKEND" --path "$RAW_PATH" --round "$round" \
+        --output-dir "$OUTPUT_ROOT/raw_async"
+done
+
+for round in 1 2 3 4 5; do
+    python -m tests.v1.gpu_connector.bench_breakdown_transaction \
+        --backend "$BACKEND" --mode raw --path "$RAW_PATH" --round "$round" \
+        --output-dir "$OUTPUT_ROOT/production_transaction"
+    python -m tests.v1.gpu_connector.bench_breakdown_transaction \
+        --backend "$BACKEND" --mode context --path "$CONTEXT_PATH" \
+        --round "$round" \
+        --output-dir "$OUTPUT_ROOT/production_transaction"
+done
+```
+
+Build the matched sync/async benchmark from the checked-in CUDA source. Set
+`UGDS_ROOT`, `CUDA_HOME`, and `CUFILE_LIB_DIR` to the corresponding installation
+directories on the test host:
+
+```bash
+mkdir -p /tmp/lmcache-breakdown
+
+nvcc -O3 -std=c++17 \
+    -I"$UGDS_ROOT/include" \
+    tests/v1/gpu_connector/bench_breakdown_sync_async.cu \
+    -L"$UGDS_ROOT/build" -lugds -lpthread \
+    -o /tmp/lmcache-breakdown/bench_ugds
+
+nvcc -O3 -std=c++17 -DUSE_NVIDIA_GDS \
+    -I"$CUDA_HOME/include" \
+    tests/v1/gpu_connector/bench_breakdown_sync_async.cu \
+    -L"$CUFILE_LIB_DIR" -lcufile -lpthread \
+    -o /tmp/lmcache-breakdown/bench_cufile
+```
+
+Run each matrix after switching the SSD to the corresponding backend. The
+cuFile target must be an allocated file of at least 2 GiB.
+
+```bash
+# uGDS matrix
+BREAKDOWN_UGDS_LIB_DIR="$UGDS_ROOT/build" \
+BREAKDOWN_CUDA_LIB_DIR="$CUDA_HOME/lib64" \
+tests/v1/gpu_connector/run_breakdown_sync_async_matrix.sh \
+    ugds /dev/ugds_drv0 /tmp/lmcache-breakdown/bench_ugds \
+    results/breakdown/runs/sync_async_matrix/ugds
+
+# cuFile matrix, after rebinding and mounting the SSD
+fallocate -l 2G /mnt/ugds_test/breakdown_matrix.bin
+BREAKDOWN_CUFILE_LIB_DIR="$CUFILE_LIB_DIR" \
+BREAKDOWN_CUDA_LIB_DIR="$CUDA_HOME/lib64" \
+tests/v1/gpu_connector/run_breakdown_sync_async_matrix.sh \
+    cufile /mnt/ugds_test/breakdown_matrix.bin \
+    /tmp/lmcache-breakdown/bench_cufile \
+    results/breakdown/runs/sync_async_matrix/cufile
+```
+
 ## Tests
 
 ```bash

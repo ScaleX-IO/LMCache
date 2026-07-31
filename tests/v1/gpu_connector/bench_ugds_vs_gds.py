@@ -8,11 +8,11 @@ CUDA stream before any synchronization.
 
 Usage:
     # Phase 1: test uGDS (990 PRO bound to ugds_drv)
-    LD_LIBRARY_PATH=/root/uGDS-workspace/uGDS/build \
+    LD_LIBRARY_PATH=/path/to/uGDS/build \
         python bench_ugds_vs_gds.py --backend ugds
 
     # Then switch driver:
-    #   cd /root/uGDS-workspace/uGDS && scripts/env_switch.sh gds 0000:b8:00.0
+    #   cd /path/to/uGDS && scripts/env_switch.sh gds 0000:b8:00.0
     #   sudo mount -o data=ordered /dev/nvme0n1 /mnt/ugds_test
 
     # Phase 2: test GDS

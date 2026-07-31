@@ -7,7 +7,7 @@ sequential cold/hot and concurrent hot cache-hit tests, then saves JSON results.
 
 Usage:
     # MP connector with uGDS (990 PRO bound to ugds_drv)
-    export LD_LIBRARY_PATH=/root/uGDS-workspace/uGDS/build
+    export LD_LIBRARY_PATH=/path/to/uGDS/build
     python tests/v1/gpu_connector/bench_e2e.py \
         --backend ugds --device /dev/ugds_drv0
 
